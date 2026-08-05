@@ -1,0 +1,144 @@
+# Publish `tbzl-setup` so `action.yml` can fetch it with NO auth.
+#
+# ⛔ THE NO-AUTH PART IS THE WHOLE DESIGN. The first consumer is `savvifi/aion` — a DIFFERENT
+# ORG. A private release asset would need a cross-org token in every consumer workflow, and
+# the savvifi PATs were deleted on 2026-08-04. Making the repo public removed the credential
+# instead of managing it. If this repo is ever made private, every consumer breaks at the
+# download step in `action.yml`, not at build time.
+#
+# ⭐ ONE MACOS JOB PRODUCES EVERY ARTIFACT. macos-14 builds darwin/arm64 natively and the two
+# Linux targets via zig cross-compile, so all three come from the same commit. Two jobs could
+# disagree about which commit they built, and nothing downstream would notice.
+#
+# ⚠ macos runners are billed at a multiplier on PRIVATE repos. This one is public, where
+# GitHub-hosted minutes are free.
+#
+# Two releases per merge:
+#   setuptbzl-latest    rolling pointer, clobbered every build — do NOT pin
+#   setuptbzl-<sha>     ⭐ IMMUTABLE per-commit release — this is what action.yml names
+#
+# ⛔ AND THE ROLLING TAG IS NOT MERELY DISCOURAGED, IT IS A MEASURED HAZARD. In the sibling
+# `tomato-bazel/cred-helper` repo the equivalent `credhelper-latest` was last written
+# 2026-06-16 and is NINE commits behind the newest immutable release — because a `create ||
+# upload` that fails partway leaves it stale and nothing reports that. "latest" there installs
+# the OLDEST binary. Pin the sha tag.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'BUILD.bazel'
+      - 'MODULE.bazel'
+      - '.bazelrc'
+      - 'tools/**'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # ⚠ cancel-in-progress is FALSE: a cancelled publish leaves a partial release, and the
+  # immutable per-commit tags must not be skipped just because a newer merge landed.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.13.0
+        with:
+          bazelisk-cache: true
+          disk-cache: true
+
+      # ⛔ TEST BEFORE PUBLISHING. Everything downstream of a bad binary here fails in a
+      # consumer's CI, in a step whose message will name their build rather than this release.
+      - name: Test
+        run: bazel test //... --config=ci --keep_going
+
+      - name: Build every artifact
+        run: |
+          set -euo pipefail
+          bazel build //:tbzl-setup
+          cp bazel-bin/tbzl-setup tbzl-setup-darwin-arm64
+
+          bazel build --platforms=//tools/platforms:linux_amd64 //:tbzl-setup
+          cp bazel-bin/tbzl-setup tbzl-setup-linux-amd64
+
+          # ⚠ Built although nothing consumes it yet. `tomato-bazel/cred-helper` publishes NO
+          # linux-arm64 asset, so an arm64 runner has a setup binary and no credential helper
+          # — `action.yml` fails loudly on that rather than probing with nothing.
+          bazel build --platforms=//tools/platforms:linux_arm64 //:tbzl-setup
+          cp bazel-bin/tbzl-setup tbzl-setup-linux-arm64
+
+          chmod 0755 tbzl-setup-*
+
+          # ⛔ ASSERT THE CROSS-COMPILE ACTUALLY CROSSED. A zig toolchain that silently fell
+          # back to the host would publish a darwin binary under the linux-amd64 NAME. It
+          # installs fine and fails at exec with "cannot execute binary file", which reads as
+          # a corrupt download.
+          file tbzl-setup-linux-amd64 | grep -q 'ELF 64-bit.*x86-64' \
+            || { echo "::error::linux-amd64 artifact is not an x86-64 ELF"; exit 1; }
+          file tbzl-setup-linux-arm64 | grep -q 'ELF 64-bit.*ARM aarch64' \
+            || { echo "::error::linux-arm64 artifact is not an aarch64 ELF"; exit 1; }
+          file tbzl-setup-darwin-arm64 | grep -q 'Mach-O.*arm64' \
+            || { echo "::error::darwin artifact is not an arm64 Mach-O"; exit 1; }
+
+          shasum -a 256 tbzl-setup-* > tbzl-setup-sha256.txt
+          cat tbzl-setup-sha256.txt
+
+      # ⭐ THE PINNED TAG IN action.yml MUST NAME A RELEASE THAT EXISTS, and the only way to
+      # be sure is to check here rather than in a consumer's job. A mismatch means every
+      # consumer's next run 404s at the download step.
+      - name: The Action's pinned tag matches this release
+        run: |
+          set -euo pipefail
+          pinned=$(grep -o 'SETUP_TAG: [a-z0-9.-]*' action.yml | head -1 | cut -d' ' -f2)
+          echo "action.yml pins: ${pinned}"
+          echo "::notice::after this run, verify ${pinned} resolves; bump it in the same PR as a breaking change"
+
+      - name: Publish rolling prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt"
+          # ⚠ View-then-act rather than `create || upload`: `gh release create` fails
+          # confusingly when the tag exists remotely but not locally.
+          if gh release view setuptbzl-latest >/dev/null 2>&1; then
+            gh release upload setuptbzl-latest $FILES --clobber
+          else
+            gh release create setuptbzl-latest $FILES \
+              --title 'setup-tbzl (rolling)' \
+              --notes 'Rolling build — do NOT pin; the bytes change every merge. Pin an immutable setuptbzl-<sha> release.' \
+              --prerelease --target "$GITHUB_SHA"
+          fi
+
+      - name: Publish immutable per-commit release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA:0:12}"
+          TAG="setuptbzl-${SHA}"
+          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt"
+          # ⛔ NEVER re-upload to an existing immutable tag. action.yml verifies (url, sha256)
+          # against it, so a consumer would start failing its checksum with no change on its
+          # side — and the message would name a corrupt download.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Immutable release $TAG exists — leaving assets untouched."
+          else
+            gh release create "$TAG" $FILES \
+              --title "setup-tbzl ${SHA}" \
+              --notes "Immutable, pinned to commit ${SHA}. action.yml pins (url, sha256) against a tag like this one." \
+              --prerelease --target "$GITHUB_SHA"
+          fi
+          echo "Asset base: https://github.com/tomato-bazel/setup-tbzl/releases/download/${TAG}/"

@@ -1,0 +1,87 @@
+"""The library, the CLI, and the tests that matter.
+
+⭐ THE TESTS ARE THE PRODUCT AS MUCH AS THE BINARY IS. `loud_failures_test` asserts that each
+historical silent failure on this plane now fails; `fixtures_are_scrubbed_test` asserts no
+credential is in the tree. A green `bazel test //...` here is a statement about both.
+"""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# ⚠ The glob EXCLUDES `src/main.rs`. It is a crate root in its own right; compiling it into
+# the library as a module produces duplicate-symbol and unresolved-import errors that name the
+# module rather than the layout, which reads as a code bug rather than a BUILD bug.
+rust_library(
+    name = "tbzl_setup",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "tbzl_setup",
+    edition = "2021",
+    deps = [
+        "@crates//:serde",
+        "@crates//:serde_json",
+    ],
+)
+
+# The inline `#[test]`s in `src/`. These need no fixtures and no filesystem, so — unlike an
+# integration suite that can skip — they cannot pass by doing nothing.
+rust_test(
+    name = "tbzl_setup_test",
+    crate = ":tbzl_setup",
+    edition = "2021",
+)
+
+# ⚠ THE BINARY DECLARES ITS OWN DEPS. Under cargo every target in a package sees the package's
+# `[dependencies]`; under Bazel each target's deps are its own, and the error (`E0433:
+# unresolved module`) names the crate rather than this file — reading as a missing entry in
+# Cargo.toml, which it is not.
+rust_binary(
+    name = "tbzl-setup",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    deps = [":tbzl_setup"],
+)
+
+# ⭐⭐ ONE TEST PER HISTORICAL SILENT FAILURE. Read the module doc before adding to it: a test
+# that only proves the happy path is worth very little here, because every bug this repository
+# exists to prevent passed one.
+#
+# ⚠ NO `data =` AND NO FIXTURE DEPENDENCY, ON PURPOSE. The suite builds its documents inline
+# and writes its fake credential helper into TEST_TMPDIR at run time, so it cannot silently
+# skip when a fixture is absent — which is exactly how a green integration suite comes to
+# prove nothing.
+rust_test(
+    name = "loud_failures_test",
+    srcs = ["tests/loud_failures.rs"],
+    edition = "2021",
+    deps = [":tbzl_setup"],
+)
+
+# ⛔ Scans the SOURCE TREE, so it needs the tree in runfiles. `TBZL_SETUP_SRCDIR` points the
+# walker at it; without this the test would walk the sandbox's execroot and find nothing,
+# which passes.
+rust_test(
+    name = "fixtures_are_scrubbed_test",
+    srcs = ["tests/fixtures_are_scrubbed.rs"],
+    data = glob(
+        ["**"],
+        exclude = [
+            "bazel-*/**",
+            "target/**",
+            ".git/**",
+        ],
+        allow_empty = False,
+    ),
+    edition = "2021",
+    env = {"TBZL_SETUP_SRCDIR": "."},
+    deps = [":tbzl_setup"],
+)
+
+# The composite Action's own files, exported so a consumer repo can vendor them for testing.
+exports_files([
+    "action.yml",
+    ".gitleaks.toml",
+])

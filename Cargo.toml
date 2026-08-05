@@ -1,0 +1,41 @@
+# ⭐ CRATE_UNIVERSE READS THIS FILE AND Cargo.lock, so there is exactly ONE dependency
+# specification in the repository and the Bazel build cannot drift from a developer's
+# `cargo test`. Adding a dependency here is the complete change; MODULE.bazel needs no edit.
+#
+# ⛔ THE BUILD IS BAZEL, ALWAYS. `cargo` is used for lockfile resolution and nothing else —
+# see .bazelrc and the release workflow. A cargo-built binary has a different linkage and a
+# different glibc floor than the one consumers download, and the difference surfaces at exec
+# on the runner with a message that names the loader rather than the toolchain.
+
+[package]
+name = "tbzl-setup"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Autoconfigure a Bazel build for the tbzl remote-execution plane, fetching every value from the platform at runtime."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# ⚠ ONE DEPENDENCY, AND NO TLS STACK. The single network fetch lives in `action.yml` as a
+# `curl` call — see the note there. Pulling rustls/ring in here would add a C/asm build to a
+# zig cross-compile for one HTTPS GET, and would put a cryptography dependency in the hot path
+# of every job on the plane for no property this binary needs.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "tbzl_setup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tbzl-setup"
+path = "src/main.rs"
+
+[profile.release]
+# ⚠ This runs at the head of every job, so its own size and start time are pure overhead.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

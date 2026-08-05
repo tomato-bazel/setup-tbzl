@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "A `tbzl.buildconfig/v1` document as the platform would serve it for the live plane.",
+    "⚠ SCRUBBED AND NON-EXECUTABLE BY CONSTRUCTION: this document contains no secret and",
+    "cannot contain one. The protocol carries a token URL, a scope and an issuer — the",
+    "coordinates for MINTING a credential — and never a credential. That is deliberate:",
+    "a served profile is cached, logged by --announce_rc, and attached to build records,",
+    "so anything secret in it would be secret in all three.",
+    "⛔ The exec-property container-image is an opaque ROUTING TOKEN the scheduler",
+    "string-compares and NEVER fetches. The account id in it is meaningless; do not 'fix' it."
+  ],
+  "protocol": "tbzl.buildconfig/v1",
+  "config_version": "2026-08-05.1",
+  "tenant": "savvifi",
+  "plane": "tbzl-build-plane",
+  "facts": {
+    "runner_label": "tbzl-linux-x64",
+    "execution": {
+      "endpoint": "grpcs://rbe.tbzl.dev:8980",
+      "instance_name": "",
+      "exec_properties": {
+        "OSFamily": "linux",
+        "container-image": "docker://042825952740.dkr.ecr.us-east-1.amazonaws.com/tbzl-rbe-worker:act-22.04-libtinfo5-py3"
+      },
+      "advertised_platform": {
+        "OSFamily": "linux",
+        "container-image": "docker://042825952740.dkr.ecr.us-east-1.amazonaws.com/tbzl-rbe-worker:act-22.04-libtinfo5-py3"
+      }
+    },
+    "cache": {
+      "endpoint": "grpcs://rbe.tbzl.dev:8980"
+    },
+    "auth": {
+      "token_url": "https://tbzl-id-build-plane.auth.us-east-1.amazoncognito.com/oauth2/token",
+      "scope": "fastverk-api/rbe:build",
+      "issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_RQcKMlCbB",
+      "extra_credential_hosts": []
+    }
+  },
+  "recommendations": {
+    "jobs": 200,
+    "remote_max_connections": 200,
+    "remote_timeout_seconds": 3600,
+    "remote_download": "toplevel",
+    "remote_local_fallback": false,
+    "basis": "analytic/2026-08-05.1 — jobs raised 64→200: concurrency sat at exactly 64 for a majority of busy wall on a ~4h aion build while the fleet had slots free, so --jobs was binding. remote_max_connections=200 from 6.3 MB/s measured per stream, flat across 4 concurrent streams (latency 0.46 ms), where input fetch dominated action time."
+  }
+}

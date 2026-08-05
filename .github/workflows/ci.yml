@@ -7,14 +7,29 @@
 # that forced `tbzl-profile` public. And within HOURS of `tbzl-profile` being made public, a
 # live BuildBuddy API key was committed into it, pasted out of a BEP fixture.
 #
-# ⚠ GITHUB'S OWN SECRET SCANNING CANNOT BE THE GATE HERE, AND I CHECKED RATHER THAN ASSUMED.
+# ⛔⛔ AND NEITHER CAN `gitleaks/gitleaks-action`. MEASURED, NOT ASSUMED — this workflow was
+# written using it and the first run failed in SEVEN SECONDS with:
+#
+#     [tomato-bazel] is an organization. License key is required.
+#     🛑 missing gitleaks license.
+#
+# The action's free tier is for repositories owned by an INDIVIDUAL. Public visibility is
+# irrelevant; ORG-owned repos need a paid key whatever their visibility. ⚠ Note the shape:
+# a red X after a few seconds with no scan performed, which is byte-identical to a code
+# failure and to this estate's Actions-billing-block signature. A gate that is red for a
+# licensing reason looks exactly like a gate that is working.
+#
+# ⭐ THE `gitleaks` BINARY ITSELF IS MIT AND FREE. Only the Action wrapper is gated. So the
+# gate runs the binary, pinned by (version, sha256) — which is better anyway: nothing in this
+# job is a third-party JavaScript action reading the full history with the job's token.
+#
+# ⚠ GITHUB'S OWN SECRET SCANNING CANNOT BE THE GATE EITHER, and I checked rather than assumed.
 # The `tomato-bazel` org is on the FREE plan with
 # `secret_scanning_enabled_for_new_repositories: false` and
 # `secret_scanning_push_protection_enabled_for_new_repositories: false`; the existing public
 # repos report `secret_scanning: {status: disabled}`. Push protection also only blocks a PUSH
-# — it is not a merge gate, and it does not run over a PR's accumulated history. So the gate
-# is this job, wired as a required status check, and GitHub's scanning is enabled alongside it
-# as defense in depth rather than as the control.
+# — it is not a merge gate, and it does not run over a PR's accumulated history. It is enabled
+# on this repo as defense in depth rather than as the control.
 #
 # ⭐ THE JOB NAME IS THE CHECK CONTEXT. Branch protection requires `secret-scan` and `test` by
 # NAME. Renaming either orphans the requirement silently: the old context stays required and
@@ -53,15 +68,175 @@ jobs:
           # the incident this gate exists for.
           fetch-depth: 0
 
-      # ⚠ Pinned to a release tag, not a moving major. This action reads the whole repository
-      # including its history; a compromised or merely changed `@v2` would do so with this
-      # job's token.
+      # ⭐ PINNED BY (VERSION, SHA256). This job reads the entire repository history; fetching
+      # an unverified binary to do it would be an unauthenticated code-execution seam in the
+      # one place that is supposed to be a control.
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2.3.9
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
-          # ⚠ No GITLEAKS_LICENSE: the action is free for public repositories, which this is.
-          # It fails closed on a license error rather than skipping, so a repo made private
-          # would turn this red rather than silently unguarded.
-          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL --fail-with-body --retry 3 -o /tmp/gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          chmod +x /tmp/gitleaks
+          /tmp/gitleaks version
+
+          # ⛔ `git` MODE, NOT `--no-git`. It walks every commit reachable from the checkout,
+          # which is why `fetch-depth: 0` above is load-bearing: a secret added in one commit
+          # of the branch and removed in a later one passes a working-tree scan while staying
+          # permanently retrievable from the merged history. That is exactly the shape of the
+          # incident this gate exists for.
+          #
+          # ⚠ --redact so a finding does not print the secret into a PUBLIC build log, which
+          # would turn detection into a second disclosure.
+          /tmp/gitleaks git . \
+            --config .gitleaks.toml \
+            --redact \
+            --verbose \
+            --exit-code 1
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.13.0
+        with:
+          bazelisk-cache: true
+          disk-cache: true
+          repository-cache: true
+
+      # ⚠ --keep_going because this estate has repeatedly had bazel name ONE failing target
+      # when several were broken; the first error is not the whole story.
+      #
+      # ⭐ This runs `loud_failures_test`, which is the substance: one test per historical
+      # silent failure on this plane, each asserting the failure is now loud. And
+      # `fixtures_are_scrubbed_test`, which walks the working tree for the JSON-escaped
+      # credential shapes gitleaks' regexes do not model.
+      - name: Test
+        run: bazel test //... --config=ci --keep_going
+
+      # ⛔ THE ACTION ITSELF IS EXERCISED AGAINST A FRESHLY BUILT BINARY, NOT THE LAST RELEASE.
+      # Without this, `action.yml` is only ever tested against the previous release — so a
+      # change to the binary and a change to the Action can never be validated together, and
+      # the first build to run them as a pair is a consumer's.
+      - name: Build the binary the Action will exec
+        run: |
+          set -euo pipefail
+          bazel build //:tbzl-setup
+          cp bazel-bin/tbzl-setup "${RUNNER_TEMP}/tbzl-setup"
+          chmod +x "${RUNNER_TEMP}/tbzl-setup"
+          echo "TBZL_SETUP_BIN=${RUNNER_TEMP}/tbzl-setup" >> "$GITHUB_ENV"
+
+      # ⭐⭐ THE END-TO-END NEGATIVE TESTS, AND THEY HAVE ALREADY EARNED THEIR PLACE.
+      #
+      # ⛔ THE FIRST VERSION OF THIS STEP ASSERTED A FAILURE THE BINARY DOES NOT AND SHOULD NOT
+      # PRODUCE — a "stale credential-helper host key" — and it went RED, which is how the
+      # discrepancy was found. `main.rs` DERIVES that variable from the endpoint and injects it
+      # before probing, so a stale name cannot displace it: the failure is unrepresentable, not
+      # detected. A unit test had "passed" only by calling `verify::all` directly and skipping
+      # the injection. Driving the real binary is what told the difference between a property
+      # the product has and a property its tests believed it had.
+      #
+      # ⚠ These assert the failures that ARE reachable in production, where the consumer still
+      # supplies something: the token PATH, and the token's CONTENTS.
+      - name: The Action fails loudly on a failed token mint
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/cred-helper" <<'HELPER'
+          #!/bin/sh
+          # A faithful model of cred-helper, fail-open included.
+          [ "$1" = "get" ] || { printf '{"headers":{}}\n'; exit 0; }
+          body=$(cat)
+          host=$(printf '%s' "$body" | sed -n 's|.*"uri":"[a-z]*://\([^/"]*\).*|\1|p' | sed 's/:[0-9]*$//')
+          key="FASTVERK_TOKEN_FILE_$(printf '%s' "$host" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+          path=$(eval printf '%s' "\"\${$key:-}\"")
+          [ -n "$path" ] && [ -s "$path" ] || { printf '{"headers":{}}\n'; exit 0; }
+          printf '{"headers":{"Authorization":["Bearer %s"]}}\n' "$(cat "$path")"
+          HELPER
+          chmod +x "${RUNNER_TEMP}/cred-helper"
+
+          # The mint step failed and nobody checked: the path is right, the file is not there.
+          set +e
+          "${TBZL_SETUP_BIN}" configure \
+            --profile tests/fixtures/tbzl-build-plane.json \
+            --out "${RUNNER_TEMP}/out" \
+            --cred-helper "${RUNNER_TEMP}/cred-helper" \
+            --token-file "${RUNNER_TEMP}/never-written" \
+            --skip-reachability > "${RUNNER_TEMP}/log" 2>&1
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/log"
+          [ "$rc" -ne 0 ] || { echo "::error::setup-tbzl ACCEPTED an absent token — the fail-open is back"; exit 1; }
+          grep -q 'TBZL-CRED-ANON' "${RUNNER_TEMP}/log" \
+            || { echo "::error::failed for the wrong reason; expected TBZL-CRED-ANON"; exit 1; }
+          # ⛔ AND NOTHING WAS WRITTEN. A bazelrc left on disk beside a failed step is picked up
+          # by a later step, and the build runs on a configuration that was rejected.
+          [ ! -f "${RUNNER_TEMP}/out/tbzl.bazelrc" ] \
+            || { echo "::error::a config was written despite a fatal finding"; exit 1; }
+          echo "::notice::an absent token was rejected, and no configuration was written"
+
+      # ⛔⛔ NON-EMPTY IS NOT A TOKEN. A failed mint that DID write — an HTML error body — passes
+      # the credential round trip, because the helper returns it happily. Before
+      # `facts.auth.token_format` this was a warning and the step went green.
+      - name: The Action fails loudly on a token file that is not a token
+        run: |
+          set -euo pipefail
+          printf '<!DOCTYPE html><html><body>502 Bad Gateway</body></html>' > "${RUNNER_TEMP}/bad-tok"
+          set +e
+          "${TBZL_SETUP_BIN}" configure \
+            --profile tests/fixtures/tbzl-build-plane.json \
+            --out "${RUNNER_TEMP}/out3" \
+            --cred-helper "${RUNNER_TEMP}/cred-helper" \
+            --token-file "${RUNNER_TEMP}/bad-tok" \
+            --skip-reachability > "${RUNNER_TEMP}/log3" 2>&1
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/log3"
+          [ "$rc" -ne 0 ] || { echo "::error::setup-tbzl ACCEPTED an HTML error page as a bearer token"; exit 1; }
+          grep -q 'TBZL-TOKEN-MALFORMED' "${RUNNER_TEMP}/log3" \
+            || { echo "::error::failed for the wrong reason; expected TBZL-TOKEN-MALFORMED"; exit 1; }
+          [ ! -f "${RUNNER_TEMP}/out3/tbzl.bazelrc" ]
+
+      # ⛔⛔ THE aion BUG, END TO END. A stale RBE_ENDPOINT inherited from a workflow-level env
+      # must stop the job, naming both values — fetching everything does not by itself remove a
+      # second copy that a later step could read.
+      - name: The Action fails loudly on a second endpoint in the environment
+        env:
+          RBE_ENDPOINT: grpcs://rbe.fastverk.com:8980
+        run: |
+          set -euo pipefail
+          printf 'aGRy.eyJpc3MiOiJodHRwczovL2NvZ25pdG8taWRwLnVzLWVhc3QtMS5hbWF6b25hd3MuY29tL3VzLWVhc3QtMV9SUWNLTWxDYkIiLCJzY29wZSI6ImZhc3R2ZXJrLWFwaS9yYmU6YnVpbGQiLCJleHAiOjQxMDI0NDQ4MDB9.c2ln' > "${RUNNER_TEMP}/good-tok"
+          set +e
+          "${TBZL_SETUP_BIN}" configure \
+            --profile tests/fixtures/tbzl-build-plane.json \
+            --out "${RUNNER_TEMP}/out4" \
+            --cred-helper "${RUNNER_TEMP}/cred-helper" \
+            --token-file "${RUNNER_TEMP}/good-tok" \
+            --skip-reachability > "${RUNNER_TEMP}/log4" 2>&1
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/log4"
+          [ "$rc" -ne 0 ] || { echo "::error::setup-tbzl ACCEPTED a second endpoint in the environment"; exit 1; }
+          grep -q 'TBZL-SHADOW-ENV' "${RUNNER_TEMP}/log4" || { echo "::error::expected TBZL-SHADOW-ENV"; exit 1; }
+          grep -q 'rbe.fastverk.com' "${RUNNER_TEMP}/log4"
+          grep -q 'rbe.tbzl.dev'     "${RUNNER_TEMP}/log4"
+
+      - name: The Action accepts a correct configuration
+        run: |
+          set -euo pipefail
+          "${TBZL_SETUP_BIN}" configure \
+            --profile tests/fixtures/tbzl-build-plane.json \
+            --out "${RUNNER_TEMP}/out2" \
+            --cred-helper "${RUNNER_TEMP}/cred-helper" \
+            --token-file "${RUNNER_TEMP}/good-tok" \
+            --skip-reachability
+          cat "${RUNNER_TEMP}/out2/tbzl.bazelrc"
+          # ⭐ The single-origin property, asserted on the artifact a build actually reads: the
+          # old endpoint appears NOWHERE, because there is no second place for it to live.
+          grep -q 'credential_helper=rbe.tbzl.dev=' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
+          grep -q 'remote_executor=grpcs://rbe.tbzl.dev:8980' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
+          ! grep -q 'fastverk.com' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
