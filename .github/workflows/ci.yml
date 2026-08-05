@@ -65,3 +65,101 @@ jobs:
           # It fails closed on a license error rather than skipping, so a repo made private
           # would turn this red rather than silently unguarded.
           GITLEAKS_CONFIG: .gitleaks.toml
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.13.0
+        with:
+          bazelisk-cache: true
+          disk-cache: true
+          repository-cache: true
+
+      # ⚠ --keep_going because this estate has repeatedly had bazel name ONE failing target
+      # when several were broken; the first error is not the whole story.
+      #
+      # ⭐ This runs `loud_failures_test`, which is the substance: one test per historical
+      # silent failure on this plane, each asserting the failure is now loud. And
+      # `fixtures_are_scrubbed_test`, which walks the working tree for the JSON-escaped
+      # credential shapes gitleaks' regexes do not model.
+      - name: Test
+        run: bazel test //... --config=ci --keep_going
+
+      # ⛔ THE ACTION ITSELF IS EXERCISED AGAINST A FRESHLY BUILT BINARY, NOT THE LAST RELEASE.
+      # Without this, `action.yml` is only ever tested against the previous release — so a
+      # change to the binary and a change to the Action can never be validated together, and
+      # the first build to run them as a pair is a consumer's.
+      - name: Build the binary the Action will exec
+        run: |
+          set -euo pipefail
+          bazel build //:tbzl-setup
+          cp bazel-bin/tbzl-setup "${RUNNER_TEMP}/tbzl-setup"
+          chmod +x "${RUNNER_TEMP}/tbzl-setup"
+          echo "TBZL_SETUP_BIN=${RUNNER_TEMP}/tbzl-setup" >> "$GITHUB_ENV"
+
+      # ⭐⭐ THE END-TO-END NEGATIVE TEST. A green happy-path smoke test would prove very
+      # little; every bug this repository exists to prevent passed one. This drives the real
+      # binary against a served profile with a DELIBERATELY WRONG credential-helper host key —
+      # the 97/97 failure — and asserts the step goes RED.
+      #
+      # ⚠ `file://` stands in for the config service, which does not exist yet. curl handles
+      # it identically, so the fetch path under test is the same one a consumer will use.
+      - name: The Action fails loudly on a stale credential-helper key
+        run: |
+          set -euo pipefail
+          # A helper that models cred-helper's fail-open: anonymous, exit 0, for any host it
+          # has no variable for.
+          cat > "${RUNNER_TEMP}/cred-helper" <<'HELPER'
+          #!/bin/sh
+          [ "$1" = "get" ] || { printf '{"headers":{}}\n'; exit 0; }
+          body=$(cat)
+          host=$(printf '%s' "$body" | sed -n 's|.*"uri":"[a-z]*://\([^/"]*\).*|\1|p' | sed 's/:[0-9]*$//')
+          key="FASTVERK_TOKEN_FILE_$(printf '%s' "$host" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+          path=$(eval printf '%s' "\"\${$key:-}\"")
+          [ -n "$path" ] && [ -s "$path" ] || { printf '{"headers":{}}\n'; exit 0; }
+          printf '{"headers":{"Authorization":["Bearer %s"]}}\n' "$(cat "$path")"
+          HELPER
+          chmod +x "${RUNNER_TEMP}/cred-helper"
+          echo 'a.token.here' > "${RUNNER_TEMP}/tok"
+
+          # The stale key: written for the PREVIOUS endpoint's host, exactly as the live
+          # workflow had it before the cutover.
+          export FASTVERK_TOKEN_FILE_RBE_FASTVERK_COM="${RUNNER_TEMP}/tok"
+
+          set +e
+          "${TBZL_SETUP_BIN}" configure \
+            --profile tests/fixtures/tbzl-build-plane.json \
+            --out "${RUNNER_TEMP}/out" \
+            --cred-helper "${RUNNER_TEMP}/cred-helper" \
+            --token-file "${RUNNER_TEMP}/tok" \
+            --skip-reachability > "${RUNNER_TEMP}/log" 2>&1
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/log"
+          [ "$rc" -ne 0 ] || { echo "::error::setup-tbzl ACCEPTED a stale credential-helper host key — the fail-open is back"; exit 1; }
+          grep -q 'TBZL-CRED-ANON' "${RUNNER_TEMP}/log" \
+            || { echo "::error::failed for the wrong reason; expected TBZL-CRED-ANON"; exit 1; }
+          # ⛔ AND NOTHING WAS WRITTEN. A bazelrc left on disk beside a failed step is picked
+          # up by a later step and the build runs on a rejected configuration.
+          [ ! -f "${RUNNER_TEMP}/out/tbzl.bazelrc" ] \
+            || { echo "::error::a config was written despite a fatal finding"; exit 1; }
+          echo "::notice::the stale host key was rejected, and no configuration was written"
+
+      - name: The Action accepts a correct configuration
+        run: |
+          set -euo pipefail
+          export FASTVERK_TOKEN_FILE_RBE_TBZL_DEV="${RUNNER_TEMP}/tok"
+          "${TBZL_SETUP_BIN}" configure \
+            --profile tests/fixtures/tbzl-build-plane.json \
+            --out "${RUNNER_TEMP}/out2" \
+            --cred-helper "${RUNNER_TEMP}/cred-helper" \
+            --token-file "${RUNNER_TEMP}/tok" \
+            --skip-reachability
+          cat "${RUNNER_TEMP}/out2/tbzl.bazelrc"
+          # ⭐ The single-origin property, asserted on the artifact a build actually reads:
+          # the old endpoint appears NOWHERE, because there is no second place for it to live.
+          grep -q 'credential_helper=rbe.tbzl.dev=' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
+          grep -q 'remote_executor=grpcs://rbe.tbzl.dev:8980' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
+          ! grep -q 'fastverk.com' "${RUNNER_TEMP}/out2/tbzl.bazelrc"

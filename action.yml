@@ -1,0 +1,239 @@
+# setup-tbzl — name your tenant; the platform decides everything else.
+#
+# ⭐⭐ THE LOAD-BEARING PROPERTY: EVERY VALUE IS FETCHED AT RUNTIME, NEVER TRANSCRIBED.
+# The endpoint, the token issuer, the scope, the `--credential_helper` host key, the
+# exec-property routing token, `--jobs` and `--remote_max_connections` all come from ONE
+# served document. They cannot drift apart because there is nowhere for a second copy to
+# live — which is what turns the duplicate-endpoint bug from "fixed" into "unrepresentable".
+#
+# ⛔ THIS STEP FAILS RATHER THAN FALLING BACK. If the platform cannot be reached, if the
+# document is empty, if the credential helper answers anonymously, if the runner is on the
+# wrong fleet, or if a stale `RBE_ENDPOINT` is still in the environment — the step is red and
+# no configuration is written. The credential helper underneath this stack fails OPEN at four
+# layers and that property has already cost two fleet-wide outages misdiagnosed as unrelated
+# systems. An autoconfigure that quietly substituted defaults would reproduce every one of
+# them at every consumer simultaneously.
+#
+# ⭐ WHY THIS IS A COMPOSITE ACTION WRAPPING A STATIC BINARY, and not JavaScript or Docker.
+# It runs at the head of every job on the plane, so its own cost is pure overhead: a
+# JavaScript action pays a Node boot, a Docker action pays an image pull on a runner whose
+# disk is already the binding constraint. A composite action that execs one static musl
+# binary pays neither, and the binary parses + verifies in well under a millisecond.
+#
+# ⚠ THE ONE NETWORK FETCH IS `curl`, NOT RUST, AND THAT IS A DELIBERATE TRADE. Putting an
+# HTTPS client in the binary means rustls or native-tls, which means ring's assembly or
+# OpenSSL under a zig cross-compile — a real risk of a binary that builds and then fails at
+# exec, for one GET whose cost is entirely I/O. curl is on every runner image and on the
+# build-runner image. The cost of the trade is that "the platform was unreachable" is
+# detected in two places (here, and again in the binary when the file is absent or empty);
+# both are loud, and the duplication is the point.
+
+name: "setup-tbzl"
+description: >-
+  Autoconfigure a Bazel build for the tbzl remote-execution plane. Name your tenant;
+  the endpoint, credentials, exec properties and tuning are fetched from the platform.
+author: "tomato-bazel"
+
+branding:
+  icon: "server"
+  color: "red"
+
+inputs:
+  tenant:
+    description: "Tenant slug, e.g. `savvifi`. The only value a workflow author should have to know."
+    required: true
+  plane:
+    description: "Plane to build on. Omit to take the tenant's default."
+    required: false
+    default: ""
+  config-version:
+    description: >-
+      Pin a specific published recommendation instead of the tenant's current one.
+      ⭐ Use this to bisect a performance regression: the knobs are versioned precisely so a
+      change to them is attributable and reversible. Omit for the current version.
+    required: false
+    default: ""
+  config-url:
+    description: >-
+      Base URL of the build-config service. ⏰ `config.tbzl.dev` does not exist yet — see
+      README, "What this does not solve". Point it at a release asset or a file:// URL to
+      exercise the Action today.
+    required: false
+    default: "https://config.tbzl.dev"
+  token-file:
+    description: >-
+      Path to the file holding the RBE bearer token, written by your token-minting step.
+      ⚠ The VARIABLE NAME the credential helper looks up is derived from the endpoint, not
+      taken from here — that derivation is the whole point. Only the path is yours.
+    required: false
+    default: "/tmp/rbe-token"
+  cred-helper-version:
+    description: >-
+      Immutable `tomato-bazel/cred-helper` release tag.
+      ⛔ NOT `credhelper-latest`: that rolling tag was last written 2026-06-16 and is nine
+      commits behind the newest immutable release, so "latest" installs the OLDEST binary —
+      one that predates both the `FASTVERK_TOKEN_FILE_<HOST>` source this Action depends on
+      and the fix for the dead-code-eliminated config feature.
+    required: false
+    default: "credhelper-a920bfbf49ea"
+  allow-repo-bazelrc:
+    description: >-
+      Permit the repository's own .bazelrc to declare remote-execution flags alongside the
+      generated one. ⛔ Off by default: `--remote_default_exec_properties` ACCUMULATES rather
+      than replacing, so two `container-image` entries produce a platform no worker
+      advertises and every action queues against an idle fleet with no error.
+    required: false
+    default: "false"
+  strict:
+    description: "Treat warnings as errors."
+    required: false
+    default: "false"
+  skip-reachability:
+    description: >-
+      Skip the TCP dial of the endpoint. ⚠ Only for a runner with no egress at configure time;
+      the dial is what turns the wrong-plane failure from a 20-minute
+      `UNAVAILABLE: Network closed for unknown reason` into a one-second step failure.
+    required: false
+    default: "false"
+
+outputs:
+  bazelrc:
+    description: >-
+      Path to the generated bazelrc. ⚠ `--bazelrc` is a STARTUP flag:
+      `bazel --bazelrc=${{ steps.x.outputs.bazelrc }} build //...`, never after the command.
+    value: ${{ steps.configure.outputs.bazelrc }}
+  config-version:
+    description: "The recommendation version this build resolved. Record it in the build record."
+    value: ${{ steps.configure.outputs.config-version }}
+  endpoint:
+    description: "The remote execution endpoint, if this plane serves execution."
+    value: ${{ steps.configure.outputs.endpoint }}
+  runner-label:
+    description: "The `runs-on:` label whose runners can reach this plane."
+    value: ${{ steps.configure.outputs.runner-label }}
+  jobs:
+    description: "The recommended --jobs, already in the bazelrc. Exposed for logging."
+    value: ${{ steps.configure.outputs.jobs }}
+
+runs:
+  using: composite
+  steps:
+    # ── 1. the binary ────────────────────────────────────────────────────────────────────
+    #
+    # ⭐ PINNED BY (TAG, SHA256), AND THE CHECKSUM IS CHECKED. This Action runs with the
+    # workflow's credentials in scope; a binary fetched over the network without verification
+    # would be an unauthenticated code-execution seam in every consumer's CI.
+    #
+    # ⚠ `TBZL_SETUP_BIN` short-circuits the download. It exists so this repo's own CI can
+    # exercise the Action against a freshly built binary — the alternative is that the Action
+    # is only ever tested against the previous release, which is how a broken release ships.
+    - name: Resolve tbzl-setup
+      id: bin
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${TBZL_SETUP_BIN:-}" ]; then
+          echo "::notice title=setup-tbzl::using TBZL_SETUP_BIN=${TBZL_SETUP_BIN}"
+          echo "path=${TBZL_SETUP_BIN}" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64)  asset=tbzl-setup-linux-amd64 ;;
+          Linux/aarch64) asset=tbzl-setup-linux-arm64 ;;
+          Darwin/arm64)  asset=tbzl-setup-darwin-arm64 ;;
+          *) echo "::error title=setup-tbzl::no tbzl-setup artifact for $(uname -s)/$(uname -m)"; exit 1 ;;
+        esac
+        dest="${RUNNER_TEMP}/tbzl-setup"
+        base="https://github.com/tomato-bazel/setup-tbzl/releases/download/${SETUP_TAG}"
+        # ⛔ --fail-with-body, not --fail. A GitHub release 404 answers with a body that says
+        # which tag was missing; --fail alone discards it and prints only "22", which reads as
+        # a network problem.
+        curl -sSL --fail-with-body --retry 3 --retry-connrefused \
+             -o "$dest" "${base}/${asset}"
+        curl -sSL --fail-with-body --retry 3 -o "${RUNNER_TEMP}/sha256.txt" \
+             "${base}/tbzl-setup-sha256.txt"
+        ( cd "$RUNNER_TEMP" && grep " ${asset}\$" sha256.txt | sed "s| ${asset}\$|  tbzl-setup|" | shasum -a 256 -c - ) \
+          || { echo "::error title=setup-tbzl::checksum mismatch for ${asset} at ${SETUP_TAG}"; exit 1; }
+        chmod +x "$dest"
+        echo "path=${dest}" >> "$GITHUB_OUTPUT"
+      env:
+        # ⚠ Pinned to this Action's own release. A consumer pins `setup-tbzl@vN`, which pins
+        # this string, which pins the binary — one pin, three layers.
+        SETUP_TAG: setuptbzl-v0.1.0
+
+    # ── 2. the credential helper ─────────────────────────────────────────────────────────
+    - name: Install the credential helper
+      id: helper
+      shell: bash
+      run: |
+        set -euo pipefail
+        dest="${RUNNER_TEMP}/cred-helper"
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64) asset=cred-helper-linux-amd64 ;;
+          Darwin/arm64) asset=cred-helper-darwin-arm64 ;;
+          # ⛔ tomato-bazel/cred-helper publishes NO linux-arm64 artifact. Fail here, naming
+          # it — an arm64 worker otherwise reaches the probe with no helper and reads as an
+          # auth failure.
+          *) echo "::error title=setup-tbzl::cred-helper has no artifact for $(uname -s)/$(uname -m)"; exit 1 ;;
+        esac
+        curl -sSL --fail-with-body --retry 3 -o "$dest" \
+          "https://github.com/tomato-bazel/cred-helper/releases/download/${CRED_HELPER_TAG}/${asset}"
+        chmod +x "$dest"
+        echo "path=${dest}" >> "$GITHUB_OUTPUT"
+      env:
+        CRED_HELPER_TAG: ${{ inputs.cred-helper-version }}
+
+    # ── 3. the profile ───────────────────────────────────────────────────────────────────
+    #
+    # ⛔ AN UNREACHABLE PLATFORM IS A FAILURE, NOT A DEFAULT. `--fail-with-body` makes a 404
+    # or a 500 non-zero and still prints the server's explanation, and `set -e` stops the job
+    # here. The binary checks again — an empty or truncated body is a 200 — and stops there
+    # too. Two checks, because this is the branch where an autoconfigure quietly ruins a
+    # fleet.
+    - name: Fetch the build profile
+      id: profile
+      shell: bash
+      run: |
+        set -euo pipefail
+        out="${RUNNER_TEMP}/tbzl-build-profile.json"
+        url="${CONFIG_URL%/}/v1/build-profile?tenant=${TENANT}"
+        [ -n "${PLANE}" ]   && url="${url}&plane=${PLANE}"
+        [ -n "${PIN}" ]     && url="${url}&config_version=${PIN}"
+        echo "::notice title=setup-tbzl::fetching ${url}"
+        # ⚠ file:// is supported by curl and is how this is exercised without the service.
+        curl -sSL --fail-with-body --retry 3 --retry-connrefused --max-time 20 \
+             -H 'Accept: application/json' -o "$out" "$url" \
+          || { echo "::error title=setup-tbzl::cannot fetch the build profile from ${url}. setup-tbzl does NOT fall back to defaults"; exit 1; }
+        [ -s "$out" ] || { echo "::error title=setup-tbzl::the platform returned an EMPTY build profile"; exit 1; }
+        echo "path=${out}" >> "$GITHUB_OUTPUT"
+      env:
+        CONFIG_URL: ${{ inputs.config-url }}
+        TENANT: ${{ inputs.tenant }}
+        PLANE: ${{ inputs.plane }}
+        PIN: ${{ inputs.config-version }}
+
+    # ── 4. verify, then write ────────────────────────────────────────────────────────────
+    - name: Configure
+      id: configure
+      shell: bash
+      run: |
+        set -euo pipefail
+        flags=()
+        [ "${ALLOW_RC}"   = "true" ] && flags+=(--allow-repo-bazelrc)
+        [ "${STRICT}"     = "true" ] && flags+=(--strict)
+        [ "${SKIP_REACH}" = "true" ] && flags+=(--skip-reachability)
+        [ -f "${GITHUB_WORKSPACE}/.bazelrc" ] && flags+=(--repo-bazelrc "${GITHUB_WORKSPACE}/.bazelrc")
+        "${SETUP}" configure \
+          --profile "${PROFILE}" \
+          --out "${RUNNER_TEMP}/tbzl" \
+          --cred-helper "${HELPER}" \
+          --token-file "${TOKEN_FILE}" \
+          "${flags[@]}"
+      env:
+        SETUP: ${{ steps.bin.outputs.path }}
+        HELPER: ${{ steps.helper.outputs.path }}
+        PROFILE: ${{ steps.profile.outputs.path }}
+        TOKEN_FILE: ${{ inputs.token-file }}
+        ALLOW_RC: ${{ inputs.allow-repo-bazelrc }}
+        STRICT: ${{ inputs.strict }}
+        SKIP_REACH: ${{ inputs.skip-reachability }}

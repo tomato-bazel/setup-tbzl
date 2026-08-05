@@ -1,0 +1,38 @@
+# setup-tbzl — build config.
+#
+# ⚠ ALL DEPS ARE PUBLIC (BCR + crates.io), so no credential helper and no registry auth is
+# needed to build this repo. Keep it that way: this repo is public so consumers in OTHER ORGS
+# can fetch its release artifacts with no auth, and a private build dependency would undo
+# exactly that.
+
+common --registry=https://bcr.bazel.build/
+
+# crate_universe is used with `isolate = True` (see MODULE.bazel).
+common --experimental_isolated_extension_usages
+
+# ─── hermetic_cc_toolchain (zig) sandbox mounts + linux link flags ───────────────────────
+# ⚠ Zig writes its cache under /tmp on linux and /var/tmp on macos; the sandbox has to reach
+# it or the cross-compile fails with a zig cache error that names neither Bazel nor the
+# toolchain.
+common --enable_platform_specific_config
+build:macos --sandbox_add_mount_pair=/var/tmp
+build:linux --sandbox_add_mount_pair=/tmp
+
+# ⚠ Section GC disabled on linux to match the proven cross-compile config in
+# tomato-bazel/cred-helper — lld otherwise drops sections whose only references are the
+# `__start_`/`__stop_` encapsulation symbols.
+build:linux --host_linkopt=-Wl,--no-gc-sections
+build:linux --linkopt=-Wl,--no-gc-sections
+
+# ─── CI ─────────────────────────────────────────────────────────────────────────────────
+# ⚠ --keep_going because this estate has repeatedly had bazel name ONE failing target when
+# several were broken; the first error is not the whole story.
+test:ci --keep_going
+test:ci --test_output=errors
+
+# ⛔ THE TEST SUITE SPAWNS A FAKE CREDENTIAL HELPER (a /bin/sh script written into
+# TEST_TMPDIR) because the real helper's fail-open can only be modelled by a process. That
+# needs /bin/sh inside the sandbox, which is present by default — but a future
+# --incompatible flag that tightens the sandbox would turn this into a confusing
+# "permission denied" rather than a missing-shell error. Recorded here so the next person
+# does not go looking in the Rust.
