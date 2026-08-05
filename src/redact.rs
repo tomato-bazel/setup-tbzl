@@ -135,32 +135,87 @@ pub fn scan(text: &str) -> Vec<Hit> {
 
 /// Replace credential-bearing values with `REDACTED` for logging.
 ///
-/// ⚠ Operates on the RAW text so the output still reads like the original; `scan` is what
-/// normalizes. A redactor that rewrote escapes would produce a log line that does not match
-/// what the tool actually saw.
+/// ⛔⛔ AN EARLIER VERSION OF THIS FUNCTION LOOKED CORRECT AND LEAKED. It scanned forward past
+/// a fixed set of separator characters and then redacted up to the next whitespace — so on the
+/// real shape
+///
+/// ```text
+/// {"headers":{"authorization":["Bearer <token>"]}}
+/// ```
+///
+/// it stopped at the `[`, replaced that, and left the token entirely intact. It had a passing
+/// test, because the test used the flat `key=value` form and never the quoted-array form the
+/// helper actually emits. ⭐ The lesson is the one this whole repository is about: a redactor
+/// is only as good as the shape it was tested against, and the shape that matters is the one
+/// production produces.
+///
+/// ⚠ Deliberately over-redacts. `Bearer <token>` contains a space, so any rule that stops at
+/// whitespace splits the credential and prints half of it. This takes the whole quoted string,
+/// or everything up to a structural terminator when unquoted.
 pub fn mask(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
     let lower = text.to_ascii_lowercase();
-    let mut i = 0;
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+
     while i < text.len() {
-        let hit = SECRET_KEYS
+        // The earliest secret key at or after `i`.
+        let Some((at, key)) = SECRET_KEYS
             .iter()
             .filter_map(|k| lower[i..].find(k).map(|p| (i + p, *k)))
-            .min_by_key(|(p, _)| *p);
-        let Some((at, key)) = hit else { break };
-        let after = at + key.len();
-        // Copy through the key and its separator.
-        let sep = text[after..]
-            .find(|c: char| !matches!(c, '=' | ':' | '"' | ' ' | '\\' | 'u' | '0' | '3' | 'd'))
-            .map_or(text.len(), |p| after + p);
-        out.push_str(&text[i..sep]);
-        let end = text[sep..]
-            .find(|c: char| c.is_whitespace() || c == '"' || c == ',' || c == '}')
-            .map_or(text.len(), |p| sep + p);
-        if end > sep {
+            .min_by_key(|(p, _)| *p)
+        else {
+            break;
+        };
+
+        // Everything up to and including the key name is copied verbatim.
+        out.push_str(&text[i..at + key.len()]);
+
+        // Skip the structural run between the key and its value: `=`, `:`, spaces, `[`,
+        // quotes, and a JSON-escaped `=`.
+        //
+        // ⛔ THE QUOTE IS THE SUBTLE ONE, AND LEAVING IT OUT LEAKED. In
+        // `"authorization":["Bearer <tok>"]` the character right after the key name is the
+        // CLOSING QUOTE OF THE KEY, not the opening quote of the value. Treating it as the
+        // start of a quoted value made the redactor consume `":[` and print the token.
+        let mut j = at + key.len();
+        let mut crossed_quote = false;
+        loop {
+            if text[j..].starts_with("\\u003d") || text[j..].starts_with("\\u003D") {
+                j += 6;
+                continue;
+            }
+            match bytes.get(j) {
+                Some(b'"') => {
+                    crossed_quote = true;
+                    j += 1;
+                }
+                Some(b'=') | Some(b':') | Some(b' ') | Some(b'[') => j += 1,
+                _ => break,
+            }
+        }
+        out.push_str(&text[at + key.len()..j]);
+
+        // ⭐ THE TERMINATOR DEPENDS ON WHETHER WE CROSSED A QUOTE, because the two shapes end
+        // differently and using one rule for both is what makes a redactor look right and be
+        // wrong:
+        //
+        //   JSON          "Bearer <tok>"        the value CONTAINS A SPACE; only `"` ends it
+        //   command line  --flag=key=<tok> …    whitespace ends it
+        //
+        // A whitespace terminator on the JSON shape prints everything after `Bearer `. A
+        // quote-only terminator on the command-line shape swallows the rest of the line.
+        let rest = &text[j..];
+        let n = if crossed_quote {
+            rest.find('"').unwrap_or(rest.len())
+        } else {
+            rest.find(|c: char| c.is_whitespace() || matches!(c, '"' | ',' | '}' | ']'))
+                .unwrap_or(rest.len())
+        };
+        if n > 0 {
             out.push_str("REDACTED");
         }
-        i = end;
+        i = j + n;
     }
     out.push_str(&text[i.min(text.len())..]);
     out
@@ -253,5 +308,29 @@ mod tests {
         let m = mask(&format!("--remote_header=x-buildbuddy-api-key={k} --jobs=64"));
         assert!(!m.contains(&k), "the secret must not survive masking: {m}");
         assert!(m.contains("--jobs=64"), "non-secret flags survive: {m}");
+    }
+
+    /// ⛔⛔ THE SHAPE THE HELPER ACTUALLY EMITS, AND THE ONE THE FIRST `mask` LEAKED. A quoted
+    /// value containing a SPACE (`Bearer <token>`) defeats any rule that stops at whitespace.
+    #[test]
+    fn a_quoted_bearer_value_is_masked_whole() {
+        let k = secret_shaped();
+        let m = mask(&format!(
+            r#"{{"headers":{{"authorization":["Bearer {k}"]}}}}"#
+        ));
+        assert!(!m.contains(&k), "the token survived masking: {m}");
+        // ⚠ The surrounding structure must remain readable, or the message stops being useful
+        // and someone removes the redaction to debug.
+        assert!(m.contains("headers"), "{m}");
+        assert!(m.contains("REDACTED"), "{m}");
+    }
+
+    /// ⚠ Text with no credential in it must come through completely untouched, or `mask`
+    /// quietly corrupts every diagnostic it is applied to.
+    #[test]
+    fn text_without_a_credential_is_unchanged() {
+        let plain = "credential helper emitted non-JSON: warning: keychain locked";
+        assert_eq!(mask(plain), plain);
+        assert_eq!(mask(""), "");
     }
 }

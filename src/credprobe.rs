@@ -105,10 +105,19 @@ pub fn parse_response(stdout: &str) -> Probe {
     let v: serde_json::Value = match serde_json::from_str(stdout.trim()) {
         Ok(v) => v,
         Err(e) => {
+            // ⛔⛔ THE HELPER'S STDOUT GOES INTO AN ERROR MESSAGE, AND ITS STDOUT CARRIES
+            // BEARER TOKENS. A malformed-but-nearly-right response — a stray log line before
+            // the JSON, a truncated write — is exactly the case that reaches here, and it is
+            // exactly the case most likely to contain a real credential. This message lands in
+            // a GitHub Actions annotation on a PUBLIC repository's build log. Redact first.
+            //
+            // ⚠ This is the leak path the `mask` function exists for; before it was wired in,
+            // `mask` was an exported, tested function with no caller — which is its own warning
+            // sign. A redactor nothing calls redacts nothing.
             return Probe::Unparseable(format!(
                 "credential helper emitted non-JSON ({e}): {:?}",
-                truncate(stdout.trim(), 200)
-            ))
+                crate::redact::mask(truncate(stdout.trim(), 200))
+            ));
         }
     };
     let Some(headers) = v.get("headers").and_then(|h| h.as_object()) else {
@@ -160,6 +169,22 @@ fn truncate(s: &str, n: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⛔⛔ A MALFORMED RESPONSE IS THE ONE MOST LIKELY TO CARRY A REAL TOKEN, and its text goes
+    /// into an annotation on a PUBLIC build log.
+    #[test]
+    fn a_malformed_response_does_not_leak_the_credential_into_the_error() {
+        let secret = format!("{}{}{}", "Zk3Qv91", "LmTr8", "Wb2Nc4Jh");
+        // A stray log line before the JSON — a real and common way to get here.
+        let out = format!("warning: keychain locked\n{{\"headers\":{{\"authorization\":[\"Bearer {secret}\"]}}}}");
+        let Probe::Unparseable(msg) = parse_response(&out) else {
+            panic!("expected Unparseable for {out:?}");
+        };
+        assert!(
+            !msg.contains(&secret),
+            "the credential must not reach the error message: {msg}"
+        );
+    }
 
     #[test]
     fn a_credential_is_recognized() {
