@@ -7,14 +7,29 @@
 # that forced `tbzl-profile` public. And within HOURS of `tbzl-profile` being made public, a
 # live BuildBuddy API key was committed into it, pasted out of a BEP fixture.
 #
-# ⚠ GITHUB'S OWN SECRET SCANNING CANNOT BE THE GATE HERE, AND I CHECKED RATHER THAN ASSUMED.
+# ⛔⛔ AND NEITHER CAN `gitleaks/gitleaks-action`. MEASURED, NOT ASSUMED — this workflow was
+# written using it and the first run failed in SEVEN SECONDS with:
+#
+#     [tomato-bazel] is an organization. License key is required.
+#     🛑 missing gitleaks license.
+#
+# The action's free tier is for repositories owned by an INDIVIDUAL. Public visibility is
+# irrelevant; ORG-owned repos need a paid key whatever their visibility. ⚠ Note the shape:
+# a red X after a few seconds with no scan performed, which is byte-identical to a code
+# failure and to this estate's Actions-billing-block signature. A gate that is red for a
+# licensing reason looks exactly like a gate that is working.
+#
+# ⭐ THE `gitleaks` BINARY ITSELF IS MIT AND FREE. Only the Action wrapper is gated. So the
+# gate runs the binary, pinned by (version, sha256) — which is better anyway: nothing in this
+# job is a third-party JavaScript action reading the full history with the job's token.
+#
+# ⚠ GITHUB'S OWN SECRET SCANNING CANNOT BE THE GATE EITHER, and I checked rather than assumed.
 # The `tomato-bazel` org is on the FREE plan with
 # `secret_scanning_enabled_for_new_repositories: false` and
 # `secret_scanning_push_protection_enabled_for_new_repositories: false`; the existing public
 # repos report `secret_scanning: {status: disabled}`. Push protection also only blocks a PUSH
-# — it is not a merge gate, and it does not run over a PR's accumulated history. So the gate
-# is this job, wired as a required status check, and GitHub's scanning is enabled alongside it
-# as defense in depth rather than as the control.
+# — it is not a merge gate, and it does not run over a PR's accumulated history. It is enabled
+# on this repo as defense in depth rather than as the control.
 #
 # ⭐ THE JOB NAME IS THE CHECK CONTEXT. Branch protection requires `secret-scan` and `test` by
 # NAME. Renaming either orphans the requirement silently: the old context stays required and
@@ -53,18 +68,35 @@ jobs:
           # the incident this gate exists for.
           fetch-depth: 0
 
-      # ⚠ Pinned to a release tag, not a moving major. This action reads the whole repository
-      # including its history; a compromised or merely changed `@v2` would do so with this
-      # job's token.
+      # ⭐ PINNED BY (VERSION, SHA256). This job reads the entire repository history; fetching
+      # an unverified binary to do it would be an unauthenticated code-execution seam in the
+      # one place that is supposed to be a control.
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2.3.9
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
-          # ⚠ No GITLEAKS_LICENSE: the action is free for public repositories, which this is.
-          # It fails closed on a license error rather than skipping, so a repo made private
-          # would turn this red rather than silently unguarded.
-          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL --fail-with-body --retry 3 -o /tmp/gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          chmod +x /tmp/gitleaks
+          /tmp/gitleaks version
+
+          # ⛔ `git` MODE, NOT `--no-git`. It walks every commit reachable from the checkout,
+          # which is why `fetch-depth: 0` above is load-bearing: a secret added in one commit
+          # of the branch and removed in a later one passes a working-tree scan while staying
+          # permanently retrievable from the merged history. That is exactly the shape of the
+          # incident this gate exists for.
+          #
+          # ⚠ --redact so a finding does not print the secret into a PUBLIC build log, which
+          # would turn detection into a second disclosure.
+          /tmp/gitleaks git . \
+            --config .gitleaks.toml \
+            --redact \
+            --verbose \
+            --exit-code 1
 
   test:
     name: test
