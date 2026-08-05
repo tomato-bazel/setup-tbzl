@@ -187,6 +187,10 @@ knows which it issues**, so it says.
 
 Stated plainly, because a half-known gap is worse than a known one.
 
+0. ⏰ **No `tbzl-setup` release is published yet**, so `action.yml` cannot download
+   its binary and says so explicitly instead of 404ing. `release.yml` publishes
+   immutable `setuptbzl-<sha>` tags on merge to main; pin one there afterwards.
+   Until then, build it and set `TBZL_SETUP_BIN`.
 1. **`config.tbzl.dev` does not exist.** Nothing is deployed. The Action fetches
    from `inputs.config-url`, which today must point at a file or a release asset.
    The service, and the publisher that renders a `ConfigSet` into this document,

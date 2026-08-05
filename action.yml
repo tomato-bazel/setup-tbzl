@@ -143,6 +143,10 @@ runs:
           Darwin/arm64)  asset=tbzl-setup-darwin-arm64 ;;
           *) echo "::error title=setup-tbzl::no tbzl-setup artifact for $(uname -s)/$(uname -m)"; exit 1 ;;
         esac
+        if [ "${SETUP_TAG}" = "setuptbzl-UNRELEASED" ]; then
+          echo "::error title=setup-tbzl::no tbzl-setup release has been published yet, so there is nothing to download. Build it and set TBZL_SETUP_BIN, or pin a published setuptbzl-<sha> in action.yml. setup-tbzl does NOT fall back to defaults."
+          exit 1
+        fi
         dest="${RUNNER_TEMP}/tbzl-setup"
         base="https://github.com/tomato-bazel/setup-tbzl/releases/download/${SETUP_TAG}"
         # ⛔ --fail-with-body, not --fail. A GitHub release 404 answers with a body that says
@@ -157,9 +161,21 @@ runs:
         chmod +x "$dest"
         echo "path=${dest}" >> "$GITHUB_OUTPUT"
       env:
-        # ⚠ Pinned to this Action's own release. A consumer pins `setup-tbzl@vN`, which pins
-        # this string, which pins the binary — one pin, three layers.
-        SETUP_TAG: setuptbzl-v0.1.0
+        # ⏰ NO RELEASE EXISTS YET, AND THIS SAYS SO RATHER THAN 404ing.
+        #
+        # `release.yml` publishes immutable `setuptbzl-<sha>` tags on merge to main. Until the
+        # first one exists there is nothing to pin, and a plausible-looking placeholder here
+        # would fail at the download step with a bare HTTP 404 — which reads as a network
+        # problem or a corrupted release, not as "this was never published". The sentinel makes
+        # the resolve step say the true thing.
+        #
+        # ⚠ AFTER THE FIRST RELEASE: set this to that `setuptbzl-<sha>`. A consumer pins
+        # `setup-tbzl@vN`, which pins this string, which pins the binary by sha256 — one pin,
+        # three layers. Never `setuptbzl-latest`: the equivalent rolling tag in
+        # `tomato-bazel/cred-helper` is NINE commits behind its newest immutable release,
+        # because a partial publish leaves it stale and nothing reports that. "Latest" there
+        # installs the oldest binary.
+        SETUP_TAG: setuptbzl-UNRELEASED
 
     # ── 2. the credential helper ─────────────────────────────────────────────────────────
     - name: Install the credential helper
