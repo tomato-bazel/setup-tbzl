@@ -1,0 +1,59 @@
+# gitleaks configuration for the merge gate.
+#
+# ⭐ EXTENDS THE DEFAULT SET RATHER THAN REPLACING IT. `useDefault = true` keeps every
+# provider rule gitleaks ships (AWS, GitHub, Slack, generic high-entropy assignments). The
+# rules below add the shapes that are specific to a Bazel remote-execution estate and that no
+# generic scanner models.
+#
+# ⛔ NO PATH ALLOWLIST FOR `tests/`. The instinct is to exempt fixtures because "they are only
+# test data" — and the live BuildBuddy key that reached `tomato-bazel/tbzl-profile` was in
+# exactly that position. Test data extracted from a real build IS production credential
+# material. If a fixture needs a secret-shaped value, assemble it at runtime; see
+# `src/redact.rs::tests::secret_shaped`, which exists for that reason.
+
+title = "setup-tbzl"
+
+[extend]
+useDefault = true
+
+# ⛔⛔ THE ONE THAT ALREADY HAPPENED. Bazel's BEP carries
+# `--remote_header=x-buildbuddy-api-key=<key>` nine times across four events.
+[[rules]]
+id = "bazel-remote-header-credential"
+description = "A credential passed to Bazel via --remote_header / --remote_cache_header / --remote_exec_header"
+regex = '''--remote(?:_cache|_exec)?_header(?:=|\\u003d)[A-Za-z0-9._-]+(?:=|\\u003d)([A-Za-z0-9+/_.-]{16,})'''
+secretGroup = 1
+keywords = ["remote_header", "remote_cache_header", "remote_exec_header"]
+
+# ⚠ THE ESCAPED FORM, AS ITS OWN RULE. gitleaks matches on raw bytes, and Bazel's JSON writer
+# escapes `=` as the six characters `=`. Every provider rule in the default set that
+# anchors on `key=value` therefore misses a secret sitting in a BEP — which is how
+# `grep 'api-key='` returns nothing on a file that contains the key nine times.
+[[rules]]
+id = "json-escaped-api-key-assignment"
+description = "An api-key style assignment whose `=` is JSON-escaped as \\u003d"
+regex = '''(?i)(?:api[_-]?key|apikey|access[_-]?token|client[_-]?secret)\\u003d([A-Za-z0-9+/_.-]{16,})'''
+secretGroup = 1
+keywords = ["u003d"]
+
+# The RBE bearer itself. A Cognito client-credentials access token is a JWT; one committed
+# here would be live for its remaining TTL.
+[[rules]]
+id = "rbe-bearer-token"
+description = "A JWT in a Bearer header or a token file"
+regex = '''(?i)bearer\s+(ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})'''
+secretGroup = 1
+keywords = ["bearer"]
+
+[allowlist]
+description = "Values that are placeholders by construction"
+# ⚠ NARROW ON PURPOSE. These are the exact stand-ins this repository uses; a broader regex
+# here is how a real key acquires camouflage. Anything added must be a string no credential
+# issuer would ever produce.
+regexes = [
+  '''REDACTED''',
+  '''\$\{\{\s*secrets\.''',
+  '''<[a-z-]+>''',
+]
+# ⛔ `paths` is DELIBERATELY EMPTY. See the note at the top of this file.
+paths = []

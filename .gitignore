@@ -1,0 +1,6 @@
+# Bazel convenience symlinks and outputs.
+bazel-*
+/target/
+
+# ⚠ NOT Cargo.lock. crate_universe reads it, so it is a build input rather than a
+# developer's local state — ignoring it makes the Bazel build unreproducible.

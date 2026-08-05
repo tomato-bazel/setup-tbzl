@@ -1,0 +1,67 @@
+# CI — the merge gate.
+#
+# ⛔⛔ THE SECRET SCAN IS A REQUIRED CHECK, NOT ADVICE, AND THAT IS NOT OPTIONAL HERE.
+#
+# This repository is PUBLIC and must stay public: `savvifi/aion` is a different org from
+# `tomato-bazel`, and a private repo's Action cannot be consumed cross-org — the same wall
+# that forced `tbzl-profile` public. And within HOURS of `tbzl-profile` being made public, a
+# live BuildBuddy API key was committed into it, pasted out of a BEP fixture.
+#
+# ⚠ GITHUB'S OWN SECRET SCANNING CANNOT BE THE GATE HERE, AND I CHECKED RATHER THAN ASSUMED.
+# The `tomato-bazel` org is on the FREE plan with
+# `secret_scanning_enabled_for_new_repositories: false` and
+# `secret_scanning_push_protection_enabled_for_new_repositories: false`; the existing public
+# repos report `secret_scanning: {status: disabled}`. Push protection also only blocks a PUSH
+# — it is not a merge gate, and it does not run over a PR's accumulated history. So the gate
+# is this job, wired as a required status check, and GitHub's scanning is enabled alongside it
+# as defense in depth rather than as the control.
+#
+# ⭐ THE JOB NAME IS THE CHECK CONTEXT. Branch protection requires `secret-scan` and `test` by
+# NAME. Renaming either orphans the requirement silently: the old context stays required and
+# never reports again, so every PR blocks forever on a check that no longer exists.
+#
+# ⛔ NO `paths:` FILTER, DELIBERATELY. A path-filtered workflow produces NO check run for a PR
+# that touches nothing it matches — and a required check that never reports blocks the PR
+# rather than passing it. Cheap job, always runs.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # ⚠ `github.event_name` is in the key so a merge to main cannot cancel an in-flight PR run
+  # of the same ref, and so a merge burst does not stack.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ⛔ FULL HISTORY. A shallow clone scans only the tip, so a secret added in an
+          # earlier commit of the branch and removed in a later one passes — while remaining
+          # permanently retrievable from the merged history. That is precisely the shape of
+          # the incident this gate exists for.
+          fetch-depth: 0
+
+      # ⚠ Pinned to a release tag, not a moving major. This action reads the whole repository
+      # including its history; a compromised or merely changed `@v2` would do so with this
+      # job's token.
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          # ⚠ No GITLEAKS_LICENSE: the action is free for public repositories, which this is.
+          # It fails closed on a license error rather than skipping, so a repo made private
+          # would turn this red rather than silently unguarded.
+          GITLEAKS_CONFIG: .gitleaks.toml
