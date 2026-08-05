@@ -143,7 +143,8 @@ Every check corresponds to a failure that actually happened on this estate.
 
 | code | catches |
 |---|---|
-| `TBZL-CRED-ANON` | ⛔⛔ the helper answered `{"headers":{}}` — stale host key, missing token file, empty token file. **97/97 targets once failed this way with a valid token on disk.** |
+| `TBZL-CRED-ANON` | ⛔⛔ the helper answered `{"headers":{}}` — a failed mint, an empty or absent token file, a helper that lost its config feature. **97/97 targets once failed this way with a valid token on disk.** |
+| `TBZL-TOKEN-MALFORMED` | ⛔⛔ a token file holding an HTML error body — **non-empty, so every other check passes** |
 | `TBZL-CRED-HELPER` | the helper binary is absent or not executable for this arch |
 | `TBZL-TOKEN-SCOPE` | a token without the exact string-matched scope |
 | `TBZL-TOKEN-ISSUER` | a token from the previous Cognito pool — well-formed, unexpired, refused |
@@ -159,6 +160,26 @@ Every check corresponds to a failure that actually happened on this estate.
 ⭐ `tests/loud_failures.rs` is one test per row. **A test that only proves the
 happy path is worth very little here** — every bug in the table at the top of
 this file passed one.
+
+### ⛔⛔ And a unit test is not enough either — two corrections the CI step forced
+
+**1. A test was wrong about the product, and passed.** It asserted that a token
+exported under the *previous* endpoint's variable name is **detected**. It is
+not, and should not be: `main.rs` *derives* that name from the endpoint and
+injects it before probing, so the correct name is always present. **The stale
+name is unrepresentable, not caught.** The test passed only by calling
+`verify::all` directly and skipping the injection — a green test describing a
+property the code does not have, inside the repository built to prevent exactly
+that. Only driving the real binary told the difference.
+
+**2. Correcting it exposed a real hole.** The round trip proves the helper
+returned *something*; it cannot prove that something is a **token**. A file
+holding an HTML error page is **non-empty**, so the helper emits
+`Authorization: Bearer <!DOCTYPE html>…`, the probe passes, and the build dies
+`UNAUTHENTICATED` against a configuration that looks entirely correct. It was a
+warning and the step went green. `facts.auth.token_format` makes it fatal — the
+client cannot demand a JWT (opaque tokens are legal OAuth2), but the **server
+knows which it issues**, so it says.
 
 ---
 
