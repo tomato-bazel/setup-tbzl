@@ -61,6 +61,13 @@ pub struct Context<'a> {
     pub runner_environment: Option<String>,
 }
 
+/// How many distinct checks `all` plus `endpoint_reachable` perform.
+///
+/// ⚠ A CONSTANT, AND IT MUST BE UPDATED WITH THE LIST BELOW. `checks_are_all_counted` fails if
+/// it drifts. The alternative — reporting `findings.len()` — announced "0 checks passed" on a
+/// clean run, which reads as "nothing was checked".
+pub const CHECK_COUNT: usize = 7;
+
 /// Run every check that does not need the network.
 ///
 /// ⚠ Reachability is separate (`endpoint_reachable`) because it is the only check that can
@@ -219,9 +226,28 @@ fn token_claims(
     };
     let claims = match jwt::claims(&token) {
         Ok(c) => c,
-        // ⚠ An opaque access token is legal OAuth2, so this is a warning: the check is
-        // unavailable, not failed. Cognito issues JWTs, so in practice it means the token
-        // file holds something else entirely — an error message, say.
+        // ⛔⛔ FATAL WHEN THE SERVER SAYS IT ISSUES JWTs, and this is the hole the end-to-end
+        // test found. The round trip above proves the helper returned SOMETHING; it cannot
+        // prove that something is a token. A token file holding an HTML error page, a curl
+        // error body or the string "null" is non-empty, so the helper emits
+        // `Authorization: Bearer <!DOCTYPE html>…`, the probe passes, and the build dies
+        // UNAUTHENTICATED with a configuration that looks entirely correct — which is the
+        // same indistinguishable symptom this whole file exists to break apart.
+        //
+        // ⚠ Only a WARNING when the server declares `opaque`, because an opaque access token
+        // is legal OAuth2 and the check is then genuinely unavailable rather than failed.
+        Err(e) if profile.facts.auth.token_format == "jwt" => {
+            return vec![Finding::fatal(
+                "TBZL-TOKEN-MALFORMED",
+                format!(
+                    "the credential for {host} is not a JWT, but this plane's issuer emits \
+                     JWTs: {e}. The token file almost certainly holds something that is not a \
+                     token — an error body, an empty JSON value, or a truncated write. It is \
+                     non-empty, so the helper returned it and every check short of this one \
+                     passed"
+                ),
+            )]
+        }
         Err(e) => {
             return vec![Finding::warn(
                 "TBZL-TOKEN-OPAQUE",
@@ -541,6 +567,13 @@ pub fn endpoint_reachable(endpoint: &str, timeout: std::time::Duration) -> Vec<F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⚠ Guards the reported count against the actual one. Six checks in `all`, plus
+    /// `endpoint_reachable`.
+    #[test]
+    fn checks_are_all_counted() {
+        assert_eq!(CHECK_COUNT, 6 + 1);
+    }
 
     #[test]
     fn dial_targets_parse() {

@@ -131,20 +131,24 @@ jobs:
           chmod +x "${RUNNER_TEMP}/tbzl-setup"
           echo "TBZL_SETUP_BIN=${RUNNER_TEMP}/tbzl-setup" >> "$GITHUB_ENV"
 
-      # ⭐⭐ THE END-TO-END NEGATIVE TEST. A green happy-path smoke test would prove very
-      # little; every bug this repository exists to prevent passed one. This drives the real
-      # binary against a served profile with a DELIBERATELY WRONG credential-helper host key —
-      # the 97/97 failure — and asserts the step goes RED.
+      # ⭐⭐ THE END-TO-END NEGATIVE TESTS, AND THEY HAVE ALREADY EARNED THEIR PLACE.
       #
-      # ⚠ `file://` stands in for the config service, which does not exist yet. curl handles
-      # it identically, so the fetch path under test is the same one a consumer will use.
-      - name: The Action fails loudly on a stale credential-helper key
+      # ⛔ THE FIRST VERSION OF THIS STEP ASSERTED A FAILURE THE BINARY DOES NOT AND SHOULD NOT
+      # PRODUCE — a "stale credential-helper host key" — and it went RED, which is how the
+      # discrepancy was found. `main.rs` DERIVES that variable from the endpoint and injects it
+      # before probing, so a stale name cannot displace it: the failure is unrepresentable, not
+      # detected. A unit test had "passed" only by calling `verify::all` directly and skipping
+      # the injection. Driving the real binary is what told the difference between a property
+      # the product has and a property its tests believed it had.
+      #
+      # ⚠ These assert the failures that ARE reachable in production, where the consumer still
+      # supplies something: the token PATH, and the token's CONTENTS.
+      - name: The Action fails loudly on a failed token mint
         run: |
           set -euo pipefail
-          # A helper that models cred-helper's fail-open: anonymous, exit 0, for any host it
-          # has no variable for.
           cat > "${RUNNER_TEMP}/cred-helper" <<'HELPER'
           #!/bin/sh
+          # A faithful model of cred-helper, fail-open included.
           [ "$1" = "get" ] || { printf '{"headers":{}}\n'; exit 0; }
           body=$(cat)
           host=$(printf '%s' "$body" | sed -n 's|.*"uri":"[a-z]*://\([^/"]*\).*|\1|p' | sed 's/:[0-9]*$//')
@@ -154,44 +158,85 @@ jobs:
           printf '{"headers":{"Authorization":["Bearer %s"]}}\n' "$(cat "$path")"
           HELPER
           chmod +x "${RUNNER_TEMP}/cred-helper"
-          echo 'a.token.here' > "${RUNNER_TEMP}/tok"
 
-          # The stale key: written for the PREVIOUS endpoint's host, exactly as the live
-          # workflow had it before the cutover.
-          export FASTVERK_TOKEN_FILE_RBE_FASTVERK_COM="${RUNNER_TEMP}/tok"
-
+          # The mint step failed and nobody checked: the path is right, the file is not there.
           set +e
           "${TBZL_SETUP_BIN}" configure \
             --profile tests/fixtures/tbzl-build-plane.json \
             --out "${RUNNER_TEMP}/out" \
             --cred-helper "${RUNNER_TEMP}/cred-helper" \
-            --token-file "${RUNNER_TEMP}/tok" \
+            --token-file "${RUNNER_TEMP}/never-written" \
             --skip-reachability > "${RUNNER_TEMP}/log" 2>&1
           rc=$?
           set -e
           cat "${RUNNER_TEMP}/log"
-          [ "$rc" -ne 0 ] || { echo "::error::setup-tbzl ACCEPTED a stale credential-helper host key — the fail-open is back"; exit 1; }
+          [ "$rc" -ne 0 ] || { echo "::error::setup-tbzl ACCEPTED an absent token — the fail-open is back"; exit 1; }
           grep -q 'TBZL-CRED-ANON' "${RUNNER_TEMP}/log" \
             || { echo "::error::failed for the wrong reason; expected TBZL-CRED-ANON"; exit 1; }
-          # ⛔ AND NOTHING WAS WRITTEN. A bazelrc left on disk beside a failed step is picked
-          # up by a later step and the build runs on a rejected configuration.
+          # ⛔ AND NOTHING WAS WRITTEN. A bazelrc left on disk beside a failed step is picked up
+          # by a later step, and the build runs on a configuration that was rejected.
           [ ! -f "${RUNNER_TEMP}/out/tbzl.bazelrc" ] \
             || { echo "::error::a config was written despite a fatal finding"; exit 1; }
-          echo "::notice::the stale host key was rejected, and no configuration was written"
+          echo "::notice::an absent token was rejected, and no configuration was written"
+
+      # ⛔⛔ NON-EMPTY IS NOT A TOKEN. A failed mint that DID write — an HTML error body — passes
+      # the credential round trip, because the helper returns it happily. Before
+      # `facts.auth.token_format` this was a warning and the step went green.
+      - name: The Action fails loudly on a token file that is not a token
+        run: |
+          set -euo pipefail
+          printf '<!DOCTYPE html><html><body>502 Bad Gateway</body></html>' > "${RUNNER_TEMP}/bad-tok"
+          set +e
+          "${TBZL_SETUP_BIN}" configure \
+            --profile tests/fixtures/tbzl-build-plane.json \
+            --out "${RUNNER_TEMP}/out3" \
+            --cred-helper "${RUNNER_TEMP}/cred-helper" \
+            --token-file "${RUNNER_TEMP}/bad-tok" \
+            --skip-reachability > "${RUNNER_TEMP}/log3" 2>&1
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/log3"
+          [ "$rc" -ne 0 ] || { echo "::error::setup-tbzl ACCEPTED an HTML error page as a bearer token"; exit 1; }
+          grep -q 'TBZL-TOKEN-MALFORMED' "${RUNNER_TEMP}/log3" \
+            || { echo "::error::failed for the wrong reason; expected TBZL-TOKEN-MALFORMED"; exit 1; }
+          [ ! -f "${RUNNER_TEMP}/out3/tbzl.bazelrc" ]
+
+      # ⛔⛔ THE aion BUG, END TO END. A stale RBE_ENDPOINT inherited from a workflow-level env
+      # must stop the job, naming both values — fetching everything does not by itself remove a
+      # second copy that a later step could read.
+      - name: The Action fails loudly on a second endpoint in the environment
+        env:
+          RBE_ENDPOINT: grpcs://rbe.fastverk.com:8980
+        run: |
+          set -euo pipefail
+          printf 'aGRy.eyJpc3MiOiJodHRwczovL2NvZ25pdG8taWRwLnVzLWVhc3QtMS5hbWF6b25hd3MuY29tL3VzLWVhc3QtMV9SUWNLTWxDYkIiLCJzY29wZSI6ImZhc3R2ZXJrLWFwaS9yYmU6YnVpbGQiLCJleHAiOjQxMDI0NDQ4MDB9.c2ln' > "${RUNNER_TEMP}/good-tok"
+          set +e
+          "${TBZL_SETUP_BIN}" configure \
+            --profile tests/fixtures/tbzl-build-plane.json \
+            --out "${RUNNER_TEMP}/out4" \
+            --cred-helper "${RUNNER_TEMP}/cred-helper" \
+            --token-file "${RUNNER_TEMP}/good-tok" \
+            --skip-reachability > "${RUNNER_TEMP}/log4" 2>&1
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/log4"
+          [ "$rc" -ne 0 ] || { echo "::error::setup-tbzl ACCEPTED a second endpoint in the environment"; exit 1; }
+          grep -q 'TBZL-SHADOW-ENV' "${RUNNER_TEMP}/log4" || { echo "::error::expected TBZL-SHADOW-ENV"; exit 1; }
+          grep -q 'rbe.fastverk.com' "${RUNNER_TEMP}/log4"
+          grep -q 'rbe.tbzl.dev'     "${RUNNER_TEMP}/log4"
 
       - name: The Action accepts a correct configuration
         run: |
           set -euo pipefail
-          export FASTVERK_TOKEN_FILE_RBE_TBZL_DEV="${RUNNER_TEMP}/tok"
           "${TBZL_SETUP_BIN}" configure \
             --profile tests/fixtures/tbzl-build-plane.json \
             --out "${RUNNER_TEMP}/out2" \
             --cred-helper "${RUNNER_TEMP}/cred-helper" \
-            --token-file "${RUNNER_TEMP}/tok" \
+            --token-file "${RUNNER_TEMP}/good-tok" \
             --skip-reachability
           cat "${RUNNER_TEMP}/out2/tbzl.bazelrc"
-          # ⭐ The single-origin property, asserted on the artifact a build actually reads:
-          # the old endpoint appears NOWHERE, because there is no second place for it to live.
+          # ⭐ The single-origin property, asserted on the artifact a build actually reads: the
+          # old endpoint appears NOWHERE, because there is no second place for it to live.
           grep -q 'credential_helper=rbe.tbzl.dev=' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
           grep -q 'remote_executor=grpcs://rbe.tbzl.dev:8980' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
           ! grep -q 'fastverk.com' "${RUNNER_TEMP}/out2/tbzl.bazelrc"

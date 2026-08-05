@@ -195,9 +195,15 @@ fn run() -> Result<(), String> {
         &[("TBZL_BAZELRC".to_string(), rc_path.display().to_string())],
     )?;
 
+    // ⚠ REPORT THE NUMBER OF CHECKS RUN, NOT THE NUMBER OF FINDINGS. An earlier version
+    // printed `findings.len()`, so a completely clean configuration announced
+    // "(0 checks passed)" — which reads as "nothing was checked", i.e. as exactly the
+    // fail-open this binary exists to prevent. A reassuring message that says the opposite of
+    // what it means is worse than no message.
     println!(
-        "::notice title=setup-tbzl::wrote {} ({} checks passed)",
+        "::notice title=setup-tbzl::wrote {} — {} checks run, {} warning(s), no fatal findings",
         rc_path.display(),
+        verify::CHECK_COUNT,
         findings.len()
     );
     Ok(())

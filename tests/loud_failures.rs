@@ -159,29 +159,69 @@ fn fatal(f: &[Finding]) -> Vec<&str> {
 
 // ── 1. the credential-helper fail-open, in its three shapes ───────────────────────────────
 
-/// ⛔⛔ THE 97/97 FAILURE. A valid token on disk the entire time, exported under the variable
-/// derived from the PREVIOUS endpoint's host. The helper answers anonymously for the host
-/// that matters, Bazel sends no Authorization header, and the RBE says UNAUTHENTICATED —
-/// which reads as a broken endpoint or a bad token.
+/// ⭐⭐ THE 97/97 FAILURE, AND WHY IT IS NOW UNREPRESENTABLE RATHER THAN MERELY CAUGHT.
+///
+/// The original bug: a valid token on disk the whole time, exported under the variable derived
+/// from the PREVIOUS endpoint's host. The helper answered anonymously for the host that
+/// mattered, Bazel sent no Authorization header, and the RBE said UNAUTHENTICATED — which
+/// reads as a broken endpoint or a bad token.
+///
+/// ⛔ AN EARLIER VERSION OF THIS TEST ASSERTED THE FAILURE WAS *DETECTED*, AND IT WAS WRONG
+/// ABOUT THE PRODUCT. `main.rs` derives the variable from the endpoint and injects it into the
+/// environment it probes with, so by the time any check runs the correct name is always
+/// present. The test passed only because it called `verify::all` directly, bypassing that
+/// injection — a test proving something the binary does not do. The repository's own
+/// end-to-end CI step caught the discrepancy.
+///
+/// ⭐ So the real claim is stronger and this is what it asserts: a stale variable CANNOT
+/// displace the derived one. The wrong name may be present, and the right name still wins.
 #[test]
-fn a_stale_credential_helper_host_key_is_loud() {
+fn a_stale_helper_variable_cannot_displace_the_derived_one() {
     let d = tmpdir("stale-key");
     let helper = fake_cred_helper(&d);
     let tok = d.join("rbe-token");
     std::fs::write(&tok, token(ISSUER, SCOPE, 1_900_000_000)).unwrap();
 
-    // The token file is real, readable and correct. Only the variable NAME is stale.
-    let env = vec![(
-        "FASTVERK_TOKEN_FILE_RBE_FASTVERK_COM",
-        tok.display().to_string(),
-    )];
-    let f = verify::all(&Doc::default().build(), &ctx(&helper, env));
+    let p = Doc::default().build();
+    // What the binary derives and exports, before any check runs.
+    let rendered = tbzl_setup::render::render(&p, &tok.display().to_string(), "/unused");
+    assert!(rendered
+        .env
+        .iter()
+        .any(|(k, _)| k == "FASTVERK_TOKEN_FILE_RBE_TBZL_DEV"));
 
+    // The stale name from the previous endpoint is ALSO present, pointing somewhere useless.
+    let mut env: Vec<(&str, String)> = vec![(
+        "FASTVERK_TOKEN_FILE_RBE_FASTVERK_COM",
+        d.join("nowhere").display().to_string(),
+    )];
+    let owned: Vec<(String, String)> = rendered.env.clone();
+    for (k, v) in &owned {
+        env.push((k.as_str(), v.clone()));
+    }
+
+    let f = verify::all(&p, &ctx(&helper, env));
     assert!(
-        fatal(&f).contains(&"TBZL-CRED-ANON"),
-        "a stale host key must be FATAL, got {:?}",
-        codes(&f)
+        fatal(&f).is_empty(),
+        "the derived variable must win over a stale one: {f:?}"
     );
+    // ⚠ And the leftover is still reported, because it authenticates nothing and its presence
+    // means someone believes it matters.
+    assert!(codes(&f).contains(&"TBZL-SHADOW-CRED"), "got {:?}", codes(&f));
+}
+
+/// ⛔ THE PROBE ITSELF, IN ISOLATION. This is the mechanism the guarantee rests on: a host the
+/// platform said to authenticate answering `{"headers":{}}` is a FATAL finding, not a
+/// successful anonymous fetch. Every remaining way to reach that state — a failed mint, a
+/// truncated write, a helper that lost its config feature to dead-code elimination — lands
+/// here.
+#[test]
+fn an_anonymous_answer_for_a_host_that_must_authenticate_is_loud() {
+    let d = tmpdir("anon");
+    let helper = fake_cred_helper(&d);
+    // No token variable at all.
+    let f = verify::all(&Doc::default().build(), &ctx(&helper, vec![]));
+    assert!(fatal(&f).contains(&"TBZL-CRED-ANON"), "got {:?}", codes(&f));
     let msg = &f.iter().find(|x| x.code == "TBZL-CRED-ANON").unwrap().message;
     assert!(
         msg.contains("FASTVERK_TOKEN_FILE_RBE_TBZL_DEV"),
@@ -189,8 +229,10 @@ fn a_stale_credential_helper_host_key_is_loud() {
     );
 }
 
-/// ⛔ The variable is right and the file is not there. Identical wire behavior, identical
-/// silence, different cause — and the message has to distinguish them.
+/// ⛔ THE MINT STEP FAILED AND DID NOT CHECK. The variable is derived correctly and the path
+/// it names does not exist. Identical wire behavior to every other miss, identical silence.
+/// ⚠ This one is reachable in production, which the stale-name case no longer is: the token
+/// path comes from the consumer, the variable name does not.
 #[test]
 fn a_missing_token_file_is_loud() {
     let d = tmpdir("missing-token");
@@ -218,6 +260,43 @@ fn an_empty_token_file_is_loud() {
         fatal(&verify::all(&Doc::default().build(), &ctx(&helper, env)))
             .contains(&"TBZL-CRED-ANON")
     );
+}
+
+/// ⛔⛔ THE HOLE THE END-TO-END TEST FOUND, AND THE REASON A HAPPY-PATH SUITE IS NOT ENOUGH.
+///
+/// The round trip proves the helper returned SOMETHING. It cannot prove that something is a
+/// token. A token file holding an HTML error page, a curl error body, or the literal `null` is
+/// NON-EMPTY — so the helper emits `Authorization: Bearer <!DOCTYPE html>…`, the probe passes,
+/// and the build dies UNAUTHENTICATED against a configuration that looks entirely correct.
+///
+/// ⚠ Before `facts.auth.token_format`, this was a WARNING and the step went green.
+#[test]
+fn a_token_file_holding_something_that_is_not_a_token_is_loud() {
+    let d = tmpdir("not-a-token");
+    let helper = fake_cred_helper(&d);
+    let tok = d.join("t");
+    // Exactly what a failed mint leaves behind when nobody checks the HTTP status.
+    std::fs::write(&tok, "<!DOCTYPE html><html><body>502 Bad Gateway</body></html>").unwrap();
+    let env = vec![("FASTVERK_TOKEN_FILE_RBE_TBZL_DEV", tok.display().to_string())];
+    let f = verify::all(&Doc::default().build(), &ctx(&helper, env));
+    assert!(fatal(&f).contains(&"TBZL-TOKEN-MALFORMED"), "got {:?}", codes(&f));
+}
+
+/// ⚠ And a plane that genuinely issues opaque tokens must NOT be broken by that check — the
+/// claim is unavailable, not failed. Otherwise the fix above would make an entire legitimate
+/// issuer unusable.
+#[test]
+fn an_opaque_token_is_a_warning_when_the_server_says_so() {
+    let d = tmpdir("opaque-ok");
+    let helper = fake_cred_helper(&d);
+    let tok = d.join("t");
+    std::fs::write(&tok, "an-opaque-oauth2-access-token").unwrap();
+    let mut p = Doc::default().build();
+    p.facts.auth.token_format = "opaque".to_string();
+    let env = vec![("FASTVERK_TOKEN_FILE_RBE_TBZL_DEV", tok.display().to_string())];
+    let f = verify::all(&p, &ctx(&helper, env));
+    assert!(fatal(&f).is_empty(), "got {:?}", f);
+    assert!(codes(&f).contains(&"TBZL-TOKEN-OPAQUE"));
 }
 
 /// ⛔ The helper binary is absent, or is not executable, or was published for the wrong

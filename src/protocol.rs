@@ -155,6 +155,21 @@ pub struct Auth {
     /// today produces an `UNAUTHENTICATED` indistinguishable from no token at all.
     pub issuer: String,
 
+    /// `jwt` (default) or `opaque`.
+    ///
+    /// ⛔⛔ THIS CLOSES A REAL HOLE, FOUND BY THIS REPOSITORY'S OWN END-TO-END TEST. The
+    /// credential round trip proves the helper returned SOMETHING; it cannot prove that
+    /// something is a token. A token file holding an HTML error page, a curl error body, or
+    /// the string "null" is non-empty, so the helper happily emits
+    /// `Authorization: Bearer <!DOCTYPE html>…` and the probe passes. The build then dies
+    /// UNAUTHENTICATED with a valid-looking configuration.
+    ///
+    /// ⚠ An opaque access token is legal OAuth2, so the client cannot simply demand a JWT.
+    /// The SERVER knows which it issues, so it says — and when it says `jwt`, a payload that
+    /// does not decode is FATAL rather than "claims unavailable".
+    #[serde(default = "default_token_format")]
+    pub token_format: String,
+
     /// Hosts beyond the endpoints that also need the credential helper (a registry mirror, a
     /// BES backend).
     ///
@@ -164,6 +179,13 @@ pub struct Auth {
     /// the drift this protocol exists to make unrepresentable.
     #[serde(default)]
     pub extra_credential_hosts: Vec<String>,
+}
+
+/// ⚠ Defaults to `jwt` rather than `opaque`, i.e. to the STRICTER reading. A profile written
+/// before this field existed is served by a Cognito pool, which issues JWTs; defaulting to
+/// `opaque` would silently disarm the check for exactly those documents.
+fn default_token_format() -> String {
+    "jwt".to_string()
 }
 
 /// The half the server computes, and the half that is allowed to be wrong.
