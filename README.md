@@ -202,9 +202,12 @@ Stated plainly, because a half-known gap is worse than a known one.
    an action and watching it fail to schedule would prove it, and that costs a
    build. What *is* made loud is server-side self-disagreement, and the local
    fallback that would otherwise hide the result.
-4. **The credential helper still fails open.** This Action makes the *consequence*
-   loud by probing it; it does not fix the helper. A `FASTVERK_CRED_STRICT=1` in
-   `tomato-bazel/cred-helper` remains the higher-value fix and is not done here.
+4. **The credential helper's fail-open is now addressed in two places, and neither
+   is complete alone.** This Action probes the helper before the build, so a miss is
+   caught early; and it exports `FASTVERK_CRED_REQUIRE` (from the same derived host
+   list) so the helper itself fails loud *during* the build. ⚠ The second half needs
+   `tomato-bazel/cred-helper#9` merged and released — until then an older helper
+   ignores the variable and keeps failing open, and only the probe protects you.
 5. **`--jobs` and `--remote_max_connections` are analytic, not learned.** They are
    derived from fleet capacity and one measured build. The feedback loop over
    `tbzl-build-records` and `tbzl-fleet-samples` is designed, not built.

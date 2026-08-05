@@ -163,6 +163,26 @@ pub fn render(profile: &Profile, token_file: &str, cred_helper: &str) -> Rendere
         // helper key impossible rather than merely discouraged.
         env.push((hostkey::token_file_var(&host), token_file.to_string()));
     }
+    // ⭐⭐ THE HOSTS THAT MUST AUTHENTICATE, FROM THE SAME LIST THE HOST KEY CAME FROM.
+    //
+    // `tomato-bazel/cred-helper` fails open: a miss yields `{"headers":{}}` and exit 0, so
+    // Bazel sends no Authorization header and the far end answers UNAUTHENTICATED — a symptom
+    // that names the endpoint rather than the credential. `FASTVERK_CRED_REQUIRE` turns a miss
+    // into a non-zero exit FOR THESE HOSTS ONLY, which is safe precisely because anonymous is
+    // a legitimate answer for a host nobody nominated and never for one somebody did.
+    //
+    // ⭐ Deriving it here rather than letting a workflow set it is the same property as the
+    // token variable: the list of hosts that must authenticate cannot disagree with the list
+    // of endpoints, because it IS that list.
+    //
+    // ⚠ HARMLESS ON AN OLDER HELPER. A binary predating the feature ignores the variable and
+    // keeps failing open — at which point `verify::credential_round_trip` is still the check
+    // that catches it. Defence in depth, in that order: the probe catches it before the build,
+    // this catches it during one.
+    let hosts = profile.credential_hosts();
+    if !hosts.is_empty() {
+        env.push(("FASTVERK_CRED_REQUIRE".into(), hosts.join(",")));
+    }
     env.push(("TBZL_CONFIG_VERSION".into(), profile.config_version.clone()));
     env.push(("TBZL_PLANE".into(), profile.plane.clone()));
 
@@ -238,6 +258,15 @@ mod tests {
         let ci = a.find("container-image=docker://x/y:z").unwrap();
         let os = a.find("OSFamily=linux").unwrap();
         assert!(os < ci, "properties must be emitted in a stable, byte-ordered sequence");
+    }
+
+    /// ⭐ The require-list and the helper host come from ONE call, so they cannot disagree.
+    #[test]
+    fn the_hosts_that_must_authenticate_are_the_endpoints_themselves() {
+        let r = render(&profile(FULL), "/tmp/tok", "/h");
+        assert!(r
+            .env
+            .contains(&("FASTVERK_CRED_REQUIRE".into(), "rbe.tbzl.dev".into())));
     }
 
     #[test]
