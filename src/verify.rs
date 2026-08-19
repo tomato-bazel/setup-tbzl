@@ -101,13 +101,31 @@ pub const CHECK_COUNT: usize = 9;
 /// fail for a reason outside the configuration — a transient network fault — and mixing it in
 /// would make the offline suite untestable.
 pub fn all(profile: &Profile, ctx: &Context<'_>) -> Vec<Finding> {
+    let mut f = without_credentials(profile, ctx);
+    f.extend(credential_round_trip(profile, ctx));
+    f
+}
+
+/// Every check that does NOT require a credential to already exist.
+///
+/// ⭐⭐ THIS EXISTS TO BREAK A DEADLOCK, NOT TO OFFER A WEAKER MODE. A consumer's token-minting
+/// step needs `token_url` and `scope`, which only this Action knows — so it has to run AFTER
+/// setup-tbzl. But `credential_round_trip` is FATAL when the helper answers anonymously, which it
+/// necessarily does before any token has been minted — so setup-tbzl could not run first. The two
+/// requirements were circular, and the way every consumer escaped it was by hard-coding the two
+/// auth values, which is precisely the transcription this Action exists to delete.
+///
+/// ⛔ THE CREDENTIAL CHECK IS DEFERRED, NEVER DROPPED. `--phase resolve` runs these checks and
+/// exports the auth values; `--phase configure` runs ALL of them, including the probe, and is
+/// what writes the bazelrc. A build still cannot start without the round trip having passed — it
+/// simply happens after the token exists instead of before it could.
+pub fn without_credentials(profile: &Profile, ctx: &Context<'_>) -> Vec<Finding> {
     let mut f = Vec::new();
     f.extend(local_fallback_is_off(profile));
     f.extend(platform_agreement(profile));
     f.extend(no_shadow_config(profile, ctx));
     f.extend(no_competing_bazelrc(ctx));
     f.extend(plane_matches_runner(profile, ctx));
-    f.extend(credential_round_trip(profile, ctx));
     f.extend(identity_matches_request(profile, ctx));
     f.extend(output_base_survives_the_build(ctx));
     f
@@ -808,5 +826,59 @@ mod tests {
         // IPv6 literal: the inner colons are not a port.
         assert_eq!(dial_target("grpcs://[::1]:8980"), Some(("[::1]".into(), 8980)));
         assert_eq!(dial_target("grpcs://[::1]"), Some(("[::1]".into(), 443)));
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+    use crate::protocol::Profile;
+
+    /// ⛔ THE DEFERRAL MUST BE A DEFERRAL, NOT A QUIET WEAKENING.
+    ///
+    /// `--phase resolve` exists to break a deadlock: the mint step needs values only the profile
+    /// carries, and the credential probe cannot pass before a token exists. The danger is that
+    /// "skip the check that is inconvenient right now" grows into skipping others — so this
+    /// asserts that the ONLY findings `all` adds over `without_credentials` are credential ones.
+    #[test]
+    fn resolve_defers_the_credential_check_and_nothing_else() {
+        let p = Profile::parse(crate::protocol::SAMPLE.as_bytes()).unwrap();
+        let ctx = Context::default();
+        let without = without_credentials(&p, &ctx);
+        let full = all(&p, &ctx);
+
+        assert!(
+            full.len() > without.len(),
+            "with no credential helper configured the probe must contribute a finding; if it \
+             does not, this test is comparing two identical lists and proves nothing"
+        );
+        let seen: Vec<&str> = without.iter().map(|f| f.code).collect();
+        for f in &full {
+            if !seen.contains(&f.code) {
+                assert!(
+                    f.code.starts_with("TBZL-CRED") || f.code.starts_with("TBZL-TOKEN"),
+                    "phase=resolve dropped {}, which is not a credential check — the split must \
+                     defer the probe, not disable unrelated verification",
+                    f.code
+                );
+            }
+        }
+    }
+
+    /// ⚠ AND EVERY NON-CREDENTIAL CHECK MUST STILL RUN IN RESOLVE. The reverse of the above:
+    /// a resolve phase that returned an empty list would also satisfy the assertion there.
+    #[test]
+    fn resolve_still_runs_the_other_checks() {
+        let p = Profile::parse(crate::protocol::SAMPLE.as_bytes()).unwrap();
+        let ctx = Context {
+            // A wrong tenant is caught by a NON-credential check, so it must fire in resolve.
+            expect: Expect { tenant: Some("not-savvifi".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let codes: Vec<&str> = without_credentials(&p, &ctx).iter().map(|f| f.code).collect();
+        assert!(
+            codes.contains(&"TBZL-IDENTITY-MISMATCH"),
+            "resolve must still catch a wrong document; got {codes:?}"
+        );
     }
 }

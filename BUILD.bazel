@@ -91,7 +91,10 @@ rust_test(
 rust_test(
     name = "boston_profile_test",
     srcs = ["tests/boston_profile.rs"],
-    data = ["tests/fixtures/tbzl-boston.json"],
+    # ⚠ EVERY boston profile, not just savvifi's. `runner_label_matches_the_orgs_scale_set`
+    # walks the whole set — a per-org profile added without its data entry would make that test
+    # walk a shorter list and pass, which is the failure mode it exists to prevent.
+    data = glob(["tests/fixtures/tbzl-boston*.json"]),
     edition = "2021",
     env = {"TBZL_SETUP_SRCDIR": "."},
     deps = [":tbzl_setup"],

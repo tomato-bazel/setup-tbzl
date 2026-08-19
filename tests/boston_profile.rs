@@ -137,3 +137,63 @@ fn jobs_is_sized_for_a_single_node_not_an_autoscaling_fleet() {
          concurrency 32"
     );
 }
+
+/// ⛔⛔ THE CROSS-ORG ERROR, WHICH NO SINGLE-PROFILE TEST COULD HAVE CAUGHT.
+///
+/// ARC scale sets are ORG-SCOPED. One physical plane is served by three of them, verified against
+/// the live cluster:
+///
+///   boston-linux-x64        -> github.com/savvifi
+///   boston-linux-x64-fv     -> github.com/fastverk
+///   boston-linux-x64-tbzl   -> github.com/tomato-bazel
+///
+/// A repo whose `runs-on` names another org's set matches NO runner, and GitHub QUEUES THAT JOB
+/// FOREVER rather than failing it — so the mistake reads as a slow build and only surfaces when
+/// the old scale set is deleted. An inventory of nine repos pending migration prescribed
+/// `boston-linux-x64` for SEVEN of them, four of which are not savvifi repos.
+///
+/// ⭐ THE TEST WALKS EVERY BOSTON PROFILE rather than checking one. The failure is a DISAGREEMENT
+/// between documents, so a per-document assertion cannot see it — which is exactly why it
+/// survived nine independent reviews.
+#[test]
+fn runner_label_matches_the_orgs_scale_set() {
+    let root = std::env::var("TBZL_SETUP_SRCDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let dir = root.join("tests/fixtures");
+    let entries = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("fixtures unreadable at {}: {e}", dir.display()));
+
+    let expected = |tenant: &str| -> Option<&'static str> {
+        match tenant {
+            "savvifi" => Some("boston-linux-x64"),
+            "fastverk" => Some("boston-linux-x64-fv"),
+            "tomato-bazel" => Some("boston-linux-x64-tbzl"),
+            _ => None,
+        }
+    };
+
+    let mut checked = 0usize;
+    for e in entries {
+        let path = e.expect("dir entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !name.starts_with("tbzl-boston") || !name.ends_with(".json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{name} unreadable: {e}"));
+        let p = tbzl_setup::protocol::Profile::parse(&bytes)
+            .unwrap_or_else(|e| panic!("{name} does not parse: {e}"));
+        assert_eq!(p.plane, "tbzl-boston", "{name} is in the boston set but names another plane");
+        let want = expected(&p.tenant)
+            .unwrap_or_else(|| panic!("{name} names tenant {:?}, which has no known boston scale set. Add it to this mapping AND create the scale set, or the profile hands out a label that matches no runner", p.tenant));
+        assert_eq!(
+            p.facts.runner_label, want,
+            "{name}: tenant {:?} must use scale set {want:?}, not {:?}. ARC scale sets are \
+             org-scoped, and a job naming another org's set QUEUES FOREVER rather than failing",
+            p.tenant, p.facts.runner_label
+        );
+        checked += 1;
+    }
+    // ⚠ An empty fixtures glob would pass every assertion above by never running one.
+    assert!(checked >= 3, "expected at least three boston profiles (one per org), walked {checked}");
+}

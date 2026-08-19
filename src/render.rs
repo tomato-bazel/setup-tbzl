@@ -183,6 +183,25 @@ pub fn render(profile: &Profile, token_file: &str, cred_helper: &str) -> Rendere
     if !hosts.is_empty() {
         env.push(("FASTVERK_CRED_REQUIRE".into(), hosts.join(",")));
     }
+    // ⭐⭐ THE TWO AUTH VALUES THE PLATFORM ALREADY KNOWS AND USED TO KEEP TO ITSELF.
+    //
+    // `facts.auth` has carried these since v1 of the protocol and NOTHING exported them, so every
+    // consumer hard-coded them into its own token-minting step:
+    //
+    //   RBE_TOKEN_URL: https://tbzl-id-build-plane.auth.us-east-1.amazoncognito.com/oauth2/token
+    //   RBE_TOKEN_SCOPE: fastverk-api/rbe:build
+    //
+    // ⛔ AND THEY ARE THE WORST TWO TO LEAVE TRANSCRIBED. The scope is STRING-MATCHED and the
+    // issuer is checked, so a stale value does not error at mint time — it yields a token that
+    // is well-formed, unexpired, and refused, and the build dies as UNAUTHENTICATED with a valid
+    // token sitting on disk. That is the 97/97 failure this repository was written for, and it
+    // was still reachable through the one door this Action did not cover.
+    //
+    // ⚠ Exported in BOTH phases. In `configure` they arrive too late to mint with and are simply
+    // informational; in `resolve` they are the whole point. Emitting them unconditionally means
+    // there is one code path, so the two phases cannot disagree about their values.
+    env.push(("RBE_TOKEN_URL".into(), f.auth.token_url.clone()));
+    env.push(("RBE_TOKEN_SCOPE".into(), f.auth.scope.clone()));
     env.push(("TBZL_CONFIG_VERSION".into(), profile.config_version.clone()));
     env.push(("TBZL_PLANE".into(), profile.plane.clone()));
 
@@ -560,5 +579,35 @@ mod home_rc_conflict_scope_tests {
         let err = splice_block(prev, "build --repository_cache=/bazel-cache/repo")
             .expect_err("both sides setting repository_cache must be fatal");
         assert!(err.contains("repository_cache"), "the error must name the flag, got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod auth_export_tests {
+    use super::*;
+    use crate::protocol::Profile;
+
+    /// ⛔ THE TWO VALUES EVERY CONSUMER USED TO HARD-CODE.
+    ///
+    /// `facts.auth` carried them from the first version of the protocol and nothing exported
+    /// them, so each repo transcribed them into its own minting step. They are the worst two to
+    /// leave transcribed: the scope is string-matched, so a stale one yields a token that is
+    /// well-formed, unexpired and REFUSED — the build dies as UNAUTHENTICATED with a valid token
+    /// on disk.
+    #[test]
+    fn the_auth_values_are_exported_for_the_minting_step() {
+        let p = Profile::parse(crate::protocol::SAMPLE.as_bytes()).unwrap();
+        let r = render(&p, "/tmp/tok", "/usr/local/bin/cred-helper");
+        let get = |k: &str| r.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(
+            get("RBE_TOKEN_URL").as_deref(),
+            Some("https://x.example/oauth2/token"),
+            "RBE_TOKEN_URL must be exported or the minting step has to hard-code it"
+        );
+        assert_eq!(
+            get("RBE_TOKEN_SCOPE").as_deref(),
+            Some("fastverk-api/rbe:build"),
+            "RBE_TOKEN_SCOPE must be exported — a stale scope mints a token that is refused"
+        );
     }
 }

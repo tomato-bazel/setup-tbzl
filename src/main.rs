@@ -57,6 +57,29 @@ struct Args {
     home_bazelrc: Option<PathBuf>,
     /// Skip writing it entirely.
     no_home_bazelrc: bool,
+    /// Which half of the job this invocation is. See `Phase`.
+    phase: Phase,
+}
+
+/// ⭐⭐ THE TWO HALVES, AND WHY THERE ARE TWO.
+///
+/// A consumer mints its own RBE token, and to do that it needs `token_url` and `scope` — which
+/// only the served profile knows. So the mint has to run AFTER this binary. But
+/// `credential_round_trip` is fatal when the helper answers anonymously, which it necessarily
+/// does before any token has been minted — so this binary could not run before the mint either.
+///
+/// ⛔ THAT DEADLOCK IS WHY EVERY CONSUMER HARD-CODED THE TWO AUTH VALUES, and they are the worst
+/// two to transcribe: the scope is string-matched, so a stale one mints a token that is
+/// well-formed, unexpired and REFUSED, and the build dies as UNAUTHENTICATED with a valid token
+/// on disk.
+///
+/// `resolve` fetches the document, runs every check that does not need a credential, and exports
+/// the auth values. `configure` runs everything including the probe and writes the bazelrc. The
+/// credential check is deferred, never skipped: no build starts without it having passed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Resolve,
+    Configure,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -74,6 +97,8 @@ fn parse_args() -> Result<Args, String> {
         output_root: None,
         home_bazelrc: None,
         no_home_bazelrc: false,
+        // ⚠ Configure is the default so an existing single-call consumer is unchanged.
+        phase: Phase::Configure,
     };
     let mut it = std::env::args().skip(1);
     // ⚠ The subcommand is required and lenient parsing is deliberately NOT offered. The
@@ -104,6 +129,16 @@ fn parse_args() -> Result<Args, String> {
             "--cache-root" => a.cache_root = Some(val()?),
             "--output-root" => a.output_root = Some(val()?),
             "--home-bazelrc" => a.home_bazelrc = Some(PathBuf::from(val()?)),
+            "--phase" => {
+                a.phase = match val()?.as_str() {
+                    "resolve" => Phase::Resolve,
+                    "configure" => Phase::Configure,
+                    // ⚠ No lenient default. A typo'd phase silently becoming `configure` would
+                    // run the credential probe before the token exists and fail as an auth
+                    // problem, which is the wrong diagnosis for a wrong flag value.
+                    other => return Err(format!("--phase must be `resolve` or `configure`, got {other:?}")),
+                }
+            }
             "--no-home-bazelrc" => a.no_home_bazelrc = true,
             "--allow-repo-bazelrc" => a.allow_repo_bazelrc = true,
             "--skip-reachability" => a.skip_reachability = true,
@@ -195,7 +230,14 @@ fn run() -> Result<(), String> {
         home: std::env::var("HOME").ok(),
     };
 
-    let mut findings = verify::all(&profile, &ctx);
+    // ⛔ THE ONLY DIFFERENCE BETWEEN THE PHASES IS *WHEN* THE CREDENTIAL PROBE RUNS, NOT WHETHER.
+    // In `resolve` no token exists yet by construction, so probing would fail on the absence of
+    // something the next step is about to create — and reporting that as an auth failure would be
+    // the wrong diagnosis. Every other check runs in both phases.
+    let mut findings = match args.phase {
+        Phase::Resolve => verify::without_credentials(&profile, &ctx),
+        Phase::Configure => verify::all(&profile, &ctx),
+    };
 
     if !args.skip_reachability {
         // ⚠ 5 seconds. Long enough that a healthy plane never trips it, short enough that a
@@ -236,6 +278,33 @@ fn run() -> Result<(), String> {
     }
 
     // ── 3. emit ──────────────────────────────────────────────────────────────────────────
+    //
+    // ⭐ RESOLVE STOPS HERE, AND WRITES NO bazelrc DELIBERATELY. Its whole job is to hand the
+    // minting step the two values it cannot otherwise know. Writing a configuration now would
+    // mean writing one whose credential round trip has not been checked — a file on disk that
+    // looks configured and was never verified, which is the exact failure `configure` refuses to
+    // produce on a fatal finding.
+    if args.phase == Phase::Resolve {
+        append_kv("GITHUB_ENV", &rendered.env)?;
+        // ⚠ THE PROFILE PATH IS EXPORTED SO THE SECOND PHASE READS THE SAME BYTES. Re-fetching
+        // could return a different document — the platform is free to publish a new
+        // config_version mid-job — and a build configured from two different documents is
+        // exactly the drift this Action exists to make unrepresentable.
+        append_kv(
+            "GITHUB_ENV",
+            &[("TBZL_PROFILE".to_string(), args.profile.display().to_string())],
+        )?;
+        append_kv("GITHUB_OUTPUT", &rendered.outputs)?;
+        println!(
+            "::notice title=setup-tbzl::resolve complete — {} checks run, {} warning(s). \
+             RBE_TOKEN_URL and RBE_TOKEN_SCOPE are exported for your minting step; run this \
+             Action again with phase=configure once the token file exists",
+            verify::CHECK_COUNT - 1,
+            findings.len()
+        );
+        return Ok(());
+    }
+
     std::fs::create_dir_all(&args.out).map_err(|e| format!("cannot create --out: {e}"))?;
     let rc_path = args.out.join("tbzl.bazelrc");
     std::fs::write(&rc_path, &rendered.bazelrc)
