@@ -148,6 +148,68 @@ what roma has to implement to take this over: **`tomato-bazel/infra`,
 
 ---
 
+## ⭐⭐ The plane decides policy; the runner decides paths
+
+Bazel needs to be told where to keep two very different things, and neither belongs
+in a workflow:
+
+| | | |
+|---|---|---|
+| `TBZL_CACHE_ROOT` | **shared** by every executor on the host | content-addressed, many writers |
+| `TBZL_OUTPUT_ROOT` | **private** to this executor | bazel locks it **exclusively** |
+
+The **runner** sets both. The **profile** carries only `recommendations.caches` —
+three booleans saying which tiers are worth enabling. That split is the point: a
+profile naming `/bazel-cache` would describe *one ARC pod's PVC*, not a plane, and
+would weld every consumer to a single hosted GHA fleet. A Buildkite agent, a dev
+container and a laptop all answer differently, and none of that is a build's
+business.
+
+⛔ **Two variables, not one, and setup-tbzl refuses the nested arrangements.** A
+single `TBZL_HOME` reads as tidier and is wrong. With the output base under the
+shared volume, every concurrent executor **serialises on one lock** — and the
+symptom is "the plane got slower", which names nothing and points at nobody. The
+reverse nesting is worse and easier to type: a shared cache *under* the output base
+is destroyed the first time anyone runs `bazel clean --expunge`.
+
+### Why it lands in `$HOME/.bazelrc`
+
+`--output_user_root` is a **startup** option — it must precede the verb. So is
+`--bazelrc`. Merely *serving* these values would still leave every workflow
+threading a flag through every call site, and the `bazel query` in some later step
+is exactly the one that gets forgotten. Before this, aion carried the same wrapper
+function in **three** steps of one file, and a second workflow was missing it
+entirely.
+
+bazel reads the home rc automatically, on every invocation, so consumers stop
+transcribing:
+
+```
+# >>> setup-tbzl layout >>>
+startup --output_user_root=/home/runner/_work/.bazelroot
+build --repository_cache=/bazel-cache/repo
+build --repo_contents_cache=/bazel-cache/contents
+build --disk_cache=/bazel-cache/disk
+# <<< setup-tbzl layout <<<
+```
+
+⛔ **It carries storage locations and nothing else.** A home rc is read *after* the
+repository's own `.bazelrc` and therefore wins, so endpoint, credential helper and
+exec properties deliberately stay in the explicit `--bazelrc` file where a repo can
+see and override them. This estate has already paid for the alternative: a
+`--remote_cache` line in one developer's `~/.bazelrc` split the cache and executor
+legs of an RBE build, and the error named the **server's** blobstore
+(`Shard 0: Object not found`) for what was a client-side misroute.
+
+⚠ **setup-tbzl owns a fenced block, not the file.** A GitHub-hosted runner ships its
+own `~/.bazelrc` — an earlier version refused to touch any file it had not written
+and failed on the first hosted run. Everything outside the fences survives
+byte-for-byte, re-running replaces the block rather than appending, and a line
+outside it setting one of the four managed flags is a **fatal** conflict rather than
+a silent win.
+
+---
+
 ## What is checked, and what each check catches
 
 Every check corresponds to a failure that actually happened on this estate.
@@ -167,10 +229,19 @@ Every check corresponds to a failure that actually happened on this estate.
 | `TBZL-PLANE-MISMATCH` | the runner is from the wrong scale set |
 | `TBZL-ENDPOINT-UNREACHABLE` | the wrong-plane routing failure, in one round trip |
 | `TBZL-LOCAL-FALLBACK` | ⛔⛔ the mask that turns every failure above into a green build |
+| `TBZL-IDENTITY-MISMATCH` | ⛔⛔ the fetched profile is **valid and someone else's** — a `config-url` copied between repos returns 200, parses, and passes every other check |
+| `TBZL-OUTPUT-BASE-EPHEMERAL` | ⛔⛔ the output base is on the container's **writable layer**, which `ephemeral-storage` bounds — measured at 7.1 GiB against an 8Gi limit, and it **evicted every runner mid-build** while reading as "the build is not advancing" |
 
 ⭐ `tests/loud_failures.rs` is one test per row. **A test that only proves the
 happy path is worth very little here** — every bug in the table at the top of
 this file passed one.
+
+⚠ **The table is the notable subset, not the full list.** `verify.rs` emits nine
+further codes — narrower variants and warnings (`TBZL-PLANE-HOSTED`,
+`TBZL-TOKEN-SOON`, `TBZL-ENDPOINT-DNS`, `TBZL-CRED-STATIC` and others). Grep
+`verify.rs` for `TBZL-` for the authoritative set; a code here that no longer
+exists in the source, or a source code nobody can find documented, is the drift to
+watch for.
 
 ### ⛔⛔ And a unit test is not enough either — two corrections the CI step forced
 
