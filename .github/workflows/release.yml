@@ -107,16 +107,6 @@ jobs:
           shasum -a 256 tbzl-setup-* tbzl-*.json > tbzl-setup-sha256.txt
           cat tbzl-setup-sha256.txt
 
-      # ⭐ THE PINNED TAG IN action.yml MUST NAME A RELEASE THAT EXISTS, and the only way to
-      # be sure is to check here rather than in a consumer's job. A mismatch means every
-      # consumer's next run 404s at the download step.
-      - name: The Action's pinned tag matches this release
-        run: |
-          set -euo pipefail
-          pinned=$(grep -o 'SETUP_TAG: [a-z0-9.-]*' action.yml | head -1 | cut -d' ' -f2)
-          echo "action.yml pins: ${pinned}"
-          echo "::notice::after this run, verify ${pinned} resolves; bump it in the same PR as a breaking change"
-
       - name: Publish rolling prerelease
         env:
           GH_TOKEN: ${{ github.token }}
@@ -168,3 +158,57 @@ jobs:
               --prerelease --target "$GITHUB_SHA"
           fi
           echo "Asset base: https://github.com/tomato-bazel/setup-tbzl/releases/download/${TAG}/"
+
+      # ⭐⭐ THE RELEASE PINS ITSELF, AND THEN MOVES v1. This closes the loop behind every pin
+      # problem this repository has had today.
+      #
+      # ⛔ A HAND-WRITTEN PIN CAN NEVER BE CORRECT. action.yml names the release its binary comes
+      # from, but the release for a commit does not exist until that commit is merged — so a PR
+      # can only ever name the PREVIOUS release. Three times today the guard `the pinned binary
+      # understands action.yml` went red for exactly that: a branch opened before a bump, carrying
+      # a pin that predated a flag its own action.yml passes. The guard was right every time; the
+      # ergonomics were wrong.
+      #
+      # ⛔ AND v1 WAS PURELY MANUAL, so it lagged FOUR merges. Anyone pinning setup-tbzl@v1 was
+      # getting a version with no `resolve` phase, no per-org profiles and a credential-helper
+      # false positive — and no check could see it, because every check runs against the branch,
+      # never against what the tag resolves to.
+      #
+      # So: cut the release, rewrite the pin to the tag just cut, commit, move v1 to that commit.
+      # v1 then always names a commit whose action.yml pins its OWN release, which is the only
+      # self-consistent state and one no human can produce by hand.
+      #
+      # ⚠ IT CANNOT LOOP. A push made with GITHUB_TOKEN does not create a workflow run, so the
+      # pin commit does not re-trigger release.yml.
+      - name: Pin action.yml at this release and move v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="setuptbzl-${GITHUB_SHA:0:12}"
+
+          current=$(sed -n 's/^ *SETUP_TAG: *\(.*\)$/\1/p' action.yml | head -1)
+          [ -n "$current" ] || { echo "::error::could not read SETUP_TAG from action.yml — the pin cannot be updated and v1 must NOT move"; exit 1; }
+
+          if [ "$current" = "$TAG" ]; then
+            echo "::notice::action.yml already pins ${TAG}"
+          else
+            sed -i "s|SETUP_TAG: ${current}|SETUP_TAG: ${TAG}|" action.yml
+            # ⚠ Verify the substitution rather than trusting sed, whose exit code is 0 whether or
+            # not it matched anything.
+            grep -q "SETUP_TAG: ${TAG}" action.yml || { echo "::error::pin rewrite did not take effect (still ${current})"; exit 1; }
+            git -c user.name='setup-tbzl-ci' -c user.email='ci@tomato-bazel.invalid' \
+              commit -q -a -m "release: pin action.yml at ${TAG}" \
+              -m "Written by release.yml after publishing ${TAG}. A hand-written pin can only ever name the PREVIOUS release, because the release for a commit does not exist until that commit is merged."
+            git push origin HEAD:main
+            echo "::notice::pinned action.yml at ${TAG}"
+          fi
+
+          # ⛔ v1 MOVES TO THE PINNED COMMIT, NOT TO $GITHUB_SHA. Those differ whenever the step
+          # above committed, and the pinned commit is the only one whose action.yml names this
+          # release. Moving v1 to $GITHUB_SHA would republish the stale pin under the tag
+          # consumers actually use — which is the bug this whole step exists to end.
+          target=$(git rev-parse HEAD)
+          git tag -f v1 "$target"
+          git push -f origin refs/tags/v1
+          echo "::notice::v1 -> ${target:0:12} (pins ${TAG})"
