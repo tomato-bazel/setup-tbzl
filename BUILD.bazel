@@ -80,6 +80,23 @@ rust_test(
     deps = [":tbzl_setup"],
 )
 
+# ⛔ ONE TEST PER SILENT FAILURE THE tbzl-boston CUTOVER HIT. A WRONG profile parses perfectly,
+# so parsing is not the property under test — every assertion is a value that is accepted,
+# stored, echoed back, and then produces a build that hangs or lies rather than an error.
+#
+# ⚠ NEEDS THE FIXTURE IN RUNFILES, and FAILS rather than skips if it is absent. `data` is
+# scoped to the one file instead of globbing the tree: a test that can silently skip when its
+# input is missing is the shape this suite exists to prevent, and a narrow `data` makes the
+# absence a hard error at the read.
+rust_test(
+    name = "boston_profile_test",
+    srcs = ["tests/boston_profile.rs"],
+    data = ["tests/fixtures/tbzl-boston.json"],
+    edition = "2021",
+    env = {"TBZL_SETUP_SRCDIR": "."},
+    deps = [":tbzl_setup"],
+)
+
 # The composite Action's own files, exported so a consumer repo can vendor them for testing.
 exports_files([
     "action.yml",
