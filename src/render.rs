@@ -424,17 +424,29 @@ pub fn splice_block(prev: &str, block: &str) -> Result<String, String> {
     };
 
     let foreign = format!("{before}{after}");
-    // ⛔ A conflicting flag OUTSIDE our fences is fatal. Silently winning would discard a
-    // setting someone made on purpose, and this file overrides the repository's own .bazelrc.
-    for flag in OWNED_FLAGS {
+
+    // ⛔ A CONFLICT IS "WE BOTH SET IT", NOT "YOU SET IT" — AND GETTING THAT WRONG BROKE THIS
+    // ACTION'S OWN CI. A GitHub-hosted runner's ~/.bazelrc ships
+    // `common --repository_cache=/home/runner/.cache/bazel-repo`; on that runner TBZL_CACHE_ROOT
+    // is unset, so the block below contains NO cache lines and there is nothing to fight over.
+    // Checking the whole owned-flag list regardless of what we emit failed every hosted
+    // consumer over a flag setup-tbzl was not setting.
+    //
+    // So the owned set is derived from the block we are about to write. Only a flag present on
+    // BOTH sides can silently discard someone's intent, and only that is fatal.
+    let emitting: Vec<&&str> = OWNED_FLAGS.iter().filter(|f| block.contains(**f)).collect();
+    for flag in emitting {
         for line in foreign.lines() {
             let l = line.trim();
-            if !l.starts_with('#') && l.contains(flag) {
+            // ⚠ A commented-out flag is not a conflict; refusing on it would fail any file whose
+            // author documented the option, which is common and harmless.
+            if !l.starts_with('#') && l.contains(*flag) {
                 return Err(format!(
                     "$HOME/.bazelrc already sets `{flag}` outside setup-tbzl's block:\n    {l}\n\
-                     setup-tbzl manages that flag, and a home bazelrc overrides the repository's \
-                     own .bazelrc — so one of the two settings would silently lose. Remove that \
-                     line, or pass --no-home-bazelrc and configure the layout yourself"
+                     setup-tbzl is also setting it from the runner's layout, and a home bazelrc \
+                     overrides the repository's own .bazelrc — so one of the two settings would \
+                     silently lose. Remove that line, or pass --no-home-bazelrc and configure \
+                     the layout yourself"
                 ));
             }
         }
@@ -519,5 +531,34 @@ mod home_rc_tests {
         let out = splice_block("", "startup --output_user_root=/w").unwrap();
         assert!(out.starts_with(BLOCK_BEGIN), "got:\n{out}");
         assert!(out.trim_end().ends_with(BLOCK_END));
+    }
+}
+
+#[cfg(test)]
+mod home_rc_conflict_scope_tests {
+    use super::*;
+
+    /// ⛔ THE SECOND FAILURE THIS ACTION'S OWN CI CAUGHT. A GitHub-hosted runner's ~/.bazelrc
+    /// ships `common --repository_cache=/home/runner/.cache/bazel-repo`. On that runner
+    /// TBZL_CACHE_ROOT is unset, so setup-tbzl emits no cache lines at all — there is nothing to
+    /// conflict with. An earlier version checked the whole owned-flag list regardless of what it
+    /// was writing and failed every hosted consumer over a flag it was not setting.
+    #[test]
+    fn a_flag_we_are_not_emitting_is_not_a_conflict() {
+        let prev = "common --repository_cache=/home/runner/.cache/bazel-repo\n";
+        // The block a runner with no TBZL_CACHE_ROOT produces: output base only.
+        let out = splice_block(prev, "startup --output_user_root=/w/.bazelroot")
+            .expect("no cache lines emitted, so the runner's own repository_cache is not a conflict");
+        assert!(out.contains("common --repository_cache="), "the runner's line must survive");
+    }
+
+    /// ⛔ BUT THE SAME FILE IS FATAL ONCE WE DO EMIT THAT FLAG — otherwise one of two deliberate
+    /// settings silently loses, and a home rc beats the repository's own .bazelrc.
+    #[test]
+    fn the_same_line_is_a_conflict_once_we_emit_that_flag() {
+        let prev = "common --repository_cache=/home/runner/.cache/bazel-repo\n";
+        let err = splice_block(prev, "build --repository_cache=/bazel-cache/repo")
+            .expect_err("both sides setting repository_cache must be fatal");
+        assert!(err.contains("repository_cache"), "the error must name the flag, got: {err}");
     }
 }
