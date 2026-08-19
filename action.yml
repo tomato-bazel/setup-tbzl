@@ -239,7 +239,7 @@ runs:
         #
         # A consumer pins `setup-tbzl@vN`, which pins this string, which pins the binary by
         # sha256 — one pin, three layers.
-        SETUP_TAG: setuptbzl-4bd9e365a801
+        SETUP_TAG: setuptbzl-065ba68faa05
 
     # ── 2. the credential helper ─────────────────────────────────────────────────────────
     - name: Install the credential helper
