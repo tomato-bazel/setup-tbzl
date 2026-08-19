@@ -37,6 +37,42 @@ pub const PROTOCOL: &str = "tbzl.buildconfig/v1";
 /// This binary's own version, used against the document's `min_client`.
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Which cache tiers the plane recommends. See `layout` for where they land.
+///
+/// ⚠ EVERY TIER DEFAULTS TO ON, and that is the safe direction here. A tier enabled with no
+/// `TBZL_CACHE_ROOT` configured emits nothing at all — `layout` has no path to give it — so the
+/// cost of a wrong `true` is a cold build, while the cost of a wrong `false` is a cold build
+/// that looks configured. Neither corrupts anything; the louder failure is the one that still
+/// works.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Caches {
+    /// `--repository_cache`: downloaded archives, content-addressed, many readers.
+    #[serde(default = "yes")]
+    pub repository: bool,
+    /// `--repo_contents_cache` (bazel 9): EXTRACTED repository contents, shareable across
+    /// workspaces. ⭐ The tier that took a fresh-pod build from 72s to 19s on this estate.
+    #[serde(default = "yes")]
+    pub repo_contents: bool,
+    /// `--disk_cache`: action outputs.
+    ///
+    /// ⚠ EARNS LITTLE ALONGSIDE `--remote_executor`, because the RBE's own cache already serves
+    /// this role. Kept on by default so a run with remote execution disabled is not
+    /// pathologically slow, which is the case it exists for.
+    #[serde(default = "yes")]
+    pub disk: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Caches {
+    fn default() -> Self {
+        Self { repository: true, repo_contents: true, disk: true }
+    }
+}
+
 /// One tenant's build configuration, as served by the platform.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Profile {
@@ -197,6 +233,17 @@ fn default_token_format() -> String {
 /// because the knobs would have moved underneath the bisect.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Recommendations {
+    /// ⭐⭐ WHICH CACHE TIERS TO ENABLE — POLICY, AND DELIBERATELY NOT PATHS.
+    ///
+    /// The plane knows which tiers pay off against it. It does NOT know where a given executor
+    /// has disk: `/bazel-cache` is a property of one ARC pod's PVC, not of tbzl-boston. A
+    /// profile carrying absolute paths would describe a runner rather than a plane, and would
+    /// weld every consumer to one hosted GHA fleet — a Buildkite agent, a laptop or a second
+    /// pod shape could not use it. `layout` resolves the paths from the RUNNER instead, via
+    /// `TBZL_CACHE_ROOT` / `TBZL_OUTPUT_ROOT`.
+    #[serde(default)]
+    pub caches: Caches,
+
     /// Client-side action concurrency.
     ///
     /// ⚠ MEASURED WRONG IN BOTH DIRECTIONS IN ONE DAY on this estate: a 2-core runner's

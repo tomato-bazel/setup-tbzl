@@ -71,6 +71,22 @@ inputs:
       ⏰ When `config.tbzl.dev` exists it serves a document at a stable URL and this input
       goes back to having a default; the protocol does not change.
     required: true
+  cache-root:
+    description: >-
+      Override `TBZL_CACHE_ROOT` — a directory SHARED by every executor on this host, holding
+      the content-addressed bazel caches. ⭐ NORMALLY LEFT EMPTY: the runner declares it, which
+      is what keeps this Action independent of any one runner fleet. A pod, a Buildkite agent
+      and a laptop all answer differently, and none of that belongs in a workflow.
+    required: false
+    default: ""
+  output-root:
+    description: >-
+      Override `TBZL_OUTPUT_ROOT` — a directory PRIVATE to this executor, holding bazel's
+      output base. ⛔ It must NOT be inside `cache-root`: bazel takes an EXCLUSIVE lock on the
+      output base, so executors sharing one serialise instead of sharing, and the symptom is
+      "the plane got slower" rather than an error. setup-tbzl refuses that arrangement.
+    required: false
+    default: ""
   token-file:
     description: >-
       Path to the file holding the RBE bearer token, written by your token-minting step.
@@ -261,6 +277,11 @@ runs:
         # ⚠ Empty values are passed through deliberately: the binary treats an empty expectation
         # as "not asserted", so `plane`/`config-version` stay optional without a second code
         # path here that could disagree with the binary about what empty means.
+        # ⚠ ONLY WHEN NON-EMPTY, and that is not a style choice. An Action input that was not
+        # supplied renders as the empty string; passing it through would MASK the value the
+        # runner itself set, turning "I did not override this" into "there is no shared cache".
+        [ -n "${CACHE_ROOT}" ]  && flags+=(--cache-root "${CACHE_ROOT}")
+        [ -n "${OUTPUT_ROOT}" ] && flags+=(--output-root "${OUTPUT_ROOT}")
         [ -n "${TENANT}" ] && flags+=(--expect-tenant "${TENANT}")
         [ -n "${PLANE}" ]  && flags+=(--expect-plane "${PLANE}")
         [ -n "${PIN}" ]    && flags+=(--expect-config-version "${PIN}")
@@ -283,6 +304,8 @@ runs:
         TENANT: ${{ inputs.tenant }}
         PLANE: ${{ inputs.plane }}
         PIN: ${{ inputs.config-version }}
+        CACHE_ROOT: ${{ inputs.cache-root }}
+        OUTPUT_ROOT: ${{ inputs.output-root }}
         ALLOW_RC: ${{ inputs.allow-repo-bazelrc }}
         STRICT: ${{ inputs.strict }}
         SKIP_REACH: ${{ inputs.skip-reachability }}

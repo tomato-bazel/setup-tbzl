@@ -147,6 +147,11 @@ fn ctx<'a>(helper: &'a Path, env: Vec<(&str, String)>) -> Context<'a> {
         // ⚠ Deliberately unasserted here. These tests exercise the OTHER checks; asserting an
         // identity would make every one of them depend on the fixture's tenant string.
         expect: Default::default(),
+        // ⚠ Also unasserted: these tests predate the layout convention and exercise other
+        // checks. `output_base_survives_the_build` is only fatal on a self-hosted runner, and
+        // `runner_environment` is None here, so an empty layout is correctly quiet.
+        layout: Default::default(),
+        home: None,
     }
 }
 
