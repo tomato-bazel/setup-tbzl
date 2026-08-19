@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "A `tbzl.buildconfig/v1` document for tbzl-boston, tenant `tomato-bazel`.",
+    "\u26d4 ONE PROFILE PER TENANT, AND runner_label IS WHY. ARC scale sets are ORG-SCOPED: the",
+    "same physical plane is served by three of them \u2014 boston-linux-x64 (savvifi),",
+    "boston-linux-x64-tbzl (tomato-bazel), boston-linux-x64-fv (fastverk). A repo whose",
+    "`runs-on` names another org's set matches NO runner, and GitHub QUEUES THAT JOB FOREVER",
+    "rather than failing it \u2014 so the mistake reads as a slow build and only surfaces when the",
+    "old scale set is deleted. Verified against the live cluster, not inferred.",
+    "\u2b50 Everything else is IDENTICAL to the savvifi profile by construction: same endpoint,",
+    "same auth, same exec properties \u2014 it is one plane. Only the label differs, because only",
+    "the admission path is per-org.",
+    "\u26a0 SCRUBBED AND NON-EXECUTABLE: coordinates for minting a credential, never a credential."
+  ],
+  "protocol": "tbzl.buildconfig/v1",
+  "config_version": "2026-08-19.1",
+  "tenant": "tomato-bazel",
+  "plane": "tbzl-boston",
+  "facts": {
+    "runner_label": "boston-linux-x64-tbzl",
+    "execution": {
+      "endpoint": "grpcs://boston.rbe.tbzl.dev:8980",
+      "instance_name": "",
+      "exec_properties": {
+        "OSFamily": "linux",
+        "container-image": "docker://394050190195.dkr.ecr.us-east-1.amazonaws.com/tbzl-rbe-worker:act-22.04-libtinfo5-py3"
+      },
+      "advertised_platform": {
+        "OSFamily": "linux",
+        "container-image": "docker://394050190195.dkr.ecr.us-east-1.amazonaws.com/tbzl-rbe-worker:act-22.04-libtinfo5-py3"
+      }
+    },
+    "cache": {
+      "endpoint": "grpcs://boston.rbe.tbzl.dev:8980"
+    },
+    "auth": {
+      "token_url": "https://tbzl-id-build-plane.auth.us-east-1.amazoncognito.com/oauth2/token",
+      "scope": "fastverk-api/rbe:build",
+      "issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_RQcKMlCbB",
+      "extra_credential_hosts": []
+    }
+  },
+  "recommendations": {
+    "jobs": 64,
+    "remote_timeout_seconds": 3600,
+    "remote_download": "toplevel",
+    "remote_local_fallback": false,
+    "basis": "observational/2026-08-19.1 \u2014 NOT a tuning study, and deliberately not copied from the AWS profile. jobs=64 is the value savvifi/aion already used for the first green build on this plane (31443 processes, 14474 remote, 0 local, 946s wall, critical path 464s); it is carried forward because it is known to work here, not because it was shown to be optimal. \u26a0 The AWS profile recommends 200 from a measured study on a fleet that autoscaled to 150 workers; this box is ONE node with worker concurrency 32, so that number does not transfer and copying it would oversubscribe a fixed pool. \u23f0 Raise this only from a measurement on this plane \u2014 concurrency sitting at exactly 64 while the worker has free slots is the signal that --jobs is binding."
+  }
+}

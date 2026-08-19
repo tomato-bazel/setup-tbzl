@@ -122,7 +122,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt tbzl-boston.json tbzl-build-plane.json"
+          # ⛔ DERIVED, NOT RESTATED. This list used to name the two profiles literally while the
+          # copy step above GLOBBED them — so adding a profile copied it into place and published
+          # NOTHING, and the release looked complete from every angle except its asset list. That
+          # is the same half-published shape that made `cslib-oleans` ship darwin-only.
+          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt $(ls tbzl-*.json | tr '\n' ' ')"
+          # ⚠ An empty profile glob would silently publish binaries with no profile at all, and a
+          # consumer's config-url would then 404 against a release that exists.
+          ls tbzl-*.json >/dev/null 2>&1 || { echo "::error::no tbzl-*.json profiles were staged — the release would ship binaries with no build profile"; exit 1; }
           # ⚠ View-then-act rather than `create || upload`: `gh release create` fails
           # confusingly when the tag exists remotely but not locally.
           if gh release view setuptbzl-latest >/dev/null 2>&1; then
@@ -141,7 +148,14 @@ jobs:
           set -euo pipefail
           SHA="${GITHUB_SHA:0:12}"
           TAG="setuptbzl-${SHA}"
-          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt tbzl-boston.json tbzl-build-plane.json"
+          # ⛔ DERIVED, NOT RESTATED. This list used to name the two profiles literally while the
+          # copy step above GLOBBED them — so adding a profile copied it into place and published
+          # NOTHING, and the release looked complete from every angle except its asset list. That
+          # is the same half-published shape that made `cslib-oleans` ship darwin-only.
+          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt $(ls tbzl-*.json | tr '\n' ' ')"
+          # ⚠ An empty profile glob would silently publish binaries with no profile at all, and a
+          # consumer's config-url would then 404 against a release that exists.
+          ls tbzl-*.json >/dev/null 2>&1 || { echo "::error::no tbzl-*.json profiles were staged — the release would ship binaries with no build profile"; exit 1; }
           # ⛔ NEVER re-upload to an existing immutable tag. action.yml verifies (url, sha256)
           # against it, so a consumer would start failing its checksum with no change on its
           # side — and the message would name a corrupt download.
