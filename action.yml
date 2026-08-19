@@ -182,8 +182,31 @@ runs:
              -o "$dest" "${base}/${asset}"
         curl -sSL --fail-with-body --retry 3 -o "${RUNNER_TEMP}/sha256.txt" \
              "${base}/tbzl-setup-sha256.txt"
-        ( cd "$RUNNER_TEMP" && grep " ${asset}\$" sha256.txt | sed "s| ${asset}\$|  tbzl-setup|" | shasum -a 256 -c - ) \
-          || { echo "::error title=setup-tbzl::checksum mismatch for ${asset} at ${SETUP_TAG}"; exit 1; }
+        # ⛔ COMPARE TWO HEX STRINGS. DO NOT REBUILD A CHECKSUM FILE WITH sed.
+        #
+        # The previous version did, and it failed 100% of the time — on Linux AND macOS — for
+        # every real consumer:
+        #
+        #   grep " ${asset}$" sha256.txt | sed "s| ${asset}$|  tbzl-setup|" | shasum -a 256 -c -
+        #
+        # sha256.txt separates hash from filename with TWO spaces. The grep pattern consumed one
+        # of them and the replacement re-added two, so the rebuilt line carried THREE — and
+        # `shasum -c` read the extra space as part of the FILENAME:
+        #
+        #   |2ef92f91…426   tbzl-setup|
+        #    tbzl-setup: FAILED open or read
+        #
+        # ⛔ AND CI STRUCTURALLY COULD NOT SEE IT. Every test step sets TBZL_SETUP_BIN, which
+        # short-circuits this entire block — so the one path every consumer takes was the one
+        # path never exercised, and `v1` shipped with it broken.
+        #
+        # Extracting the field and comparing strings has no whitespace surface at all, and it
+        # distinguishes "no checksum published" from "checksum did not match" instead of
+        # reporting both as `FAILED open or read`.
+        want=$(awk -v a="${asset}" '$NF == a { print $1 }' "${RUNNER_TEMP}/sha256.txt")
+        [ -n "$want" ] || { echo "::error title=setup-tbzl::${SETUP_TAG} publishes no checksum for ${asset} — the release is incomplete. A half-published release looks complete from every angle except its asset list"; exit 1; }
+        got=$(shasum -a 256 "$dest" | awk '{ print $1 }')
+        [ "$want" = "$got" ] || { echo "::error title=setup-tbzl::checksum mismatch for ${asset} at ${SETUP_TAG}: expected ${want}, got ${got}"; exit 1; }
         chmod +x "$dest"
         echo "path=${dest}" >> "$GITHUB_OUTPUT"
       env:
@@ -221,8 +244,22 @@ runs:
           Darwin/arm64)  asset=cred-helper-darwin-arm64 ;;
           *) echo "::error title=setup-tbzl::cred-helper has no artifact for $(uname -s)/$(uname -m)"; exit 1 ;;
         esac
-        curl -sSL --fail-with-body --retry 3 -o "$dest" \
-          "https://github.com/tomato-bazel/cred-helper/releases/download/${CRED_HELPER_TAG}/${asset}"
+        base="https://github.com/tomato-bazel/cred-helper/releases/download/${CRED_HELPER_TAG}"
+        curl -sSL --fail-with-body --retry 3 -o "$dest" "${base}/${asset}"
+        # ⛔ THIS BINARY WAS FETCHED WITH NO VERIFICATION AT ALL — curl, then chmod +x. The step
+        # above argues, correctly, that an unverified download is "an unauthenticated
+        # code-execution seam in every consumer's CI". That reasoning was applied to one of the
+        # two binaries this Action installs and not the other, and cred-helper publishes
+        # cred-helper-sha256.txt — so the asymmetry bought nothing.
+        #
+        # ⚠ AND THIS IS THE BINARY THAT HANDLES THE BEARER TOKEN. If either download deserved
+        # the check more, it was this one.
+        curl -sSL --fail-with-body --retry 3 -o "${RUNNER_TEMP}/cred-helper-sha256.txt" \
+          "${base}/cred-helper-sha256.txt"
+        want=$(awk -v a="${asset}" '$NF == a { print $1 }' "${RUNNER_TEMP}/cred-helper-sha256.txt")
+        [ -n "$want" ] || { echo "::error title=setup-tbzl::${CRED_HELPER_TAG} publishes no checksum for ${asset}"; exit 1; }
+        got=$(shasum -a 256 "$dest" | awk '{ print $1 }')
+        [ "$want" = "$got" ] || { echo "::error title=setup-tbzl::cred-helper checksum mismatch for ${asset} at ${CRED_HELPER_TAG}: expected ${want}, got ${got}"; exit 1; }
         chmod +x "$dest"
         echo "path=${dest}" >> "$GITHUB_OUTPUT"
       env:
