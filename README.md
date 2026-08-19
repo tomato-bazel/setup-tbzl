@@ -1,22 +1,33 @@
 # setup-tbzl
 
-Name your tenant. The platform decides everything else.
+Name your tenant and where its profile lives. The platform decides everything else.
 
 ```yaml
 jobs:
   build:
-    runs-on: tbzl-linux-x64
+    runs-on: boston-linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: tomato-bazel/setup-tbzl@v1
         id: tbzl
         with:
           tenant: savvifi
+          config-url: https://github.com/tomato-bazel/setup-tbzl/releases/download/setuptbzl-fb750d3ddb01/tbzl-boston.json
       - run: bazel --bazelrc=${{ steps.tbzl.outputs.bazelrc }} build //...
 ```
 
 That is the whole configuration. No endpoint, no token URL, no scope, no
 `--credential_helper` host, no exec properties, no `--jobs`.
+
+⭐ **`config-url` names the document, and `tenant` is checked against it.** The
+profile is an artefact, not a query — which is what lets it be published, pinned
+and diffed, and is why this Action needs no service to exist. The cost of naming a
+document by URL is that a URL copied from another repo returns **HTTP 200 and a
+perfectly valid profile** that is simply someone else's; `tenant` is what makes
+that fatal rather than a build quietly running against another tenant's plane.
+
+⏰ When `config.tbzl.dev` exists it will serve the same document at a stable URL and
+`config-url` gets a default back. The protocol does not change.
 
 ---
 
@@ -187,10 +198,11 @@ knows which it issues**, so it says.
 
 Stated plainly, because a half-known gap is worse than a known one.
 
-0. ⏰ **No `tbzl-setup` release is published yet**, so `action.yml` cannot download
-   its binary and says so explicitly instead of 404ing. `release.yml` publishes
-   immutable `setuptbzl-<sha>` tags on merge to main; pin one there afterwards.
-   Until then, build it and set `TBZL_SETUP_BIN`.
+0. ✅ **Resolved — the first release is published and pinned.** `action.yml` pins
+   `setuptbzl-fb750d3ddb01`, verified to carry all three platform binaries *and*
+   `tbzl-setup-sha256.txt` before being pinned. ⚠ When bumping it, check the **asset
+   list**, not the tag: a release can exist with only some of its artifacts, and a
+   half-published tag looks complete from every angle except that one.
 1. ⭐ **The profiles now ship as RELEASE ASSETS, and `config.tbzl.dev` is not needed.**
    `docs/autoconfigure.md` corrected an earlier draft of this design: the profile
    must **not** be a service. This Action fails loud by design, so a config service

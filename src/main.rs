@@ -9,8 +9,14 @@
 //! tbzl-setup configure --profile <file> --out <dir>
 //!            [--cred-helper <path>] [--token-file <path>]
 //!            [--repo-bazelrc <path>] [--allow-repo-bazelrc]
+//!            [--expect-tenant <slug>] [--expect-plane <name>]
+//!            [--expect-config-version <ver>]
 //!            [--skip-reachability] [--strict]
 //! ```
+//!
+//! ⛔ `--expect-tenant` IS NOT COSMETIC. `--profile` names a file that something else fetched,
+//! so this binary is the first place that can notice the file belongs to a different tenant.
+//! Such a document is valid, parses, and passes every other check — see `verify::Expect`.
 //!
 //! ⚠ GITHUB_ENV / GITHUB_OUTPUT are read from the environment, not passed as flags, so the
 //! binary behaves identically under `act`, under a local shell, and in CI. When they are
@@ -42,6 +48,8 @@ struct Args {
     allow_repo_bazelrc: bool,
     skip_reachability: bool,
     strict: bool,
+    /// What the caller believes it fetched. See `verify::Expect`.
+    expect: verify::Expect,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -54,6 +62,7 @@ fn parse_args() -> Result<Args, String> {
         allow_repo_bazelrc: false,
         skip_reachability: false,
         strict: false,
+        expect: verify::Expect::default(),
     };
     let mut it = std::env::args().skip(1);
     // ⚠ The subcommand is required and lenient parsing is deliberately NOT offered. The
@@ -71,6 +80,12 @@ fn parse_args() -> Result<Args, String> {
             "--cred-helper" => a.cred_helper = Some(PathBuf::from(val()?)),
             "--token-file" => a.token_file = val()?,
             "--repo-bazelrc" => a.repo_bazelrc = Some(PathBuf::from(val()?)),
+            // ⛔ THE IDENTITY ASSERTIONS. `--profile` names a FILE, so nothing upstream of here
+            // has checked that the file is the one the workflow asked for. See
+            // `verify::Expect` — a valid profile for another tenant fails no other check.
+            "--expect-tenant" => a.expect.tenant = Some(val()?),
+            "--expect-plane" => a.expect.plane = Some(val()?),
+            "--expect-config-version" => a.expect.config_version = Some(val()?),
             "--allow-repo-bazelrc" => a.allow_repo_bazelrc = true,
             "--skip-reachability" => a.skip_reachability = true,
             "--strict" => a.strict = true,
@@ -131,6 +146,7 @@ fn run() -> Result<(), String> {
         repo_bazelrc: repo_rc,
         runner_name: std::env::var("RUNNER_NAME").ok(),
         runner_environment: std::env::var("RUNNER_ENVIRONMENT").ok(),
+        expect: args.expect.clone(),
     };
 
     let mut findings = verify::all(&profile, &ctx);

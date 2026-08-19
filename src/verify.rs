@@ -42,6 +42,7 @@ impl Finding {
 }
 
 /// Everything the checks need that is not in the profile.
+#[derive(Default)]
 pub struct Context<'a> {
     /// Path to the `cred-helper` binary the build will use.
     pub cred_helper: Option<&'a Path>,
@@ -59,6 +60,28 @@ pub struct Context<'a> {
     /// `RUNNER_NAME` / `RUNNER_ENVIRONMENT`, for the plane check.
     pub runner_name: Option<String>,
     pub runner_environment: Option<String>,
+    /// What the workflow ASKED FOR, to be checked against what the document turned out to be.
+    pub expect: Expect,
+}
+
+/// The identity the caller believes it fetched.
+///
+/// ⛔ THIS EXISTS BECAUSE `config-url` NAMES A DOCUMENT DIRECTLY. When the Action built a query
+/// string (`?tenant=savvifi&plane=…`), the server was the thing that resolved a name to a
+/// document, and a wrong name came back as a 404 — loud. Pointing at a URL instead moves that
+/// resolution to whoever wrote the URL, and a URL that resolves to the WRONG tenant's profile
+/// returns 200 with a perfectly valid document. Every downstream check then passes, because
+/// nothing is malformed: it is simply somebody else's plane.
+///
+/// ⚠ EACH FIELD IS OPTIONAL AND AN ABSENT ONE ASSERTS NOTHING. `tenant` is required by
+/// `action.yml`, so in CI the first field is always checked; the other two are only asserted
+/// when the workflow pinned them. Absence must not silently weaken the check, which is why the
+/// message below distinguishes "not asserted" from "asserted and matched".
+#[derive(Default, Clone, Debug)]
+pub struct Expect {
+    pub tenant: Option<String>,
+    pub plane: Option<String>,
+    pub config_version: Option<String>,
 }
 
 /// How many distinct checks `all` plus `endpoint_reachable` perform.
@@ -66,7 +89,7 @@ pub struct Context<'a> {
 /// ⚠ A CONSTANT, AND IT MUST BE UPDATED WITH THE LIST BELOW. `checks_are_all_counted` fails if
 /// it drifts. The alternative — reporting `findings.len()` — announced "0 checks passed" on a
 /// clean run, which reads as "nothing was checked".
-pub const CHECK_COUNT: usize = 7;
+pub const CHECK_COUNT: usize = 8;
 
 /// Run every check that does not need the network.
 ///
@@ -81,7 +104,53 @@ pub fn all(profile: &Profile, ctx: &Context<'_>) -> Vec<Finding> {
     f.extend(no_competing_bazelrc(ctx));
     f.extend(plane_matches_runner(profile, ctx));
     f.extend(credential_round_trip(profile, ctx));
+    f.extend(identity_matches_request(profile, ctx));
     f
+}
+
+// ── V7 ────────────────────────────────────────────────────────────────────────────────────
+/// ⛔ THE DOCUMENT IS NOT THE ONE THE WORKFLOW ASKED FOR.
+///
+/// `config-url` points at a profile document, so nothing between the workflow and the file
+/// checks that the file is the right one. A URL copied from another repo, a release asset whose
+/// name drifted, a tenant renamed upstream — all return 200 with a valid document, and every
+/// other check in this file passes on it, because it is a perfectly good profile. It is just
+/// not yours: the build then runs against another tenant's plane, authenticating with your
+/// token against their exec properties.
+///
+/// ⭐ THIS IS FATAL, NOT A WARNING, AND THAT IS THE WHOLE POINT OF THE CHECK. A warning here
+/// would be printed into a log next to a build that appeared to work. The failure it prevents
+/// is silent by construction — there is no error message anywhere downstream that says "wrong
+/// tenant", because from the plane's perspective nothing is wrong.
+fn identity_matches_request(profile: &Profile, ctx: &Context<'_>) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for (what, want, got) in [
+        ("tenant", &ctx.expect.tenant, &profile.tenant),
+        ("plane", &ctx.expect.plane, &profile.plane),
+        (
+            "config_version",
+            &ctx.expect.config_version,
+            &profile.config_version,
+        ),
+    ] {
+        // ⚠ An unasserted field is not a finding. Only `tenant` is required by `action.yml`;
+        // the others assert only when the workflow pinned them.
+        let Some(want) = want.as_deref().filter(|w| !w.is_empty()) else {
+            continue;
+        };
+        if want != got {
+            out.push(Finding::fatal(
+                "TBZL-IDENTITY-MISMATCH",
+                format!(
+                    "the fetched profile declares {what}={got:?} but this workflow asked for \
+                     {what}={want:?}. The document at `config-url` is valid — it is simply not \
+                     the one you asked for, so nothing downstream would have reported this. \
+                     Fix `config-url`, or the `{what}` input if the URL is right"
+                ),
+            ));
+        }
+    }
+    out
 }
 
 // ── V1 ────────────────────────────────────────────────────────────────────────────────────
@@ -568,11 +637,44 @@ pub fn endpoint_reachable(endpoint: &str, timeout: std::time::Duration) -> Vec<F
 mod tests {
     use super::*;
 
-    /// ⚠ Guards the reported count against the actual one. Six checks in `all`, plus
+    /// ⚠ Guards the reported count against the actual one. Seven checks in `all`, plus
     /// `endpoint_reachable`.
     #[test]
     fn checks_are_all_counted() {
-        assert_eq!(CHECK_COUNT, 6 + 1);
+        assert_eq!(CHECK_COUNT, 7 + 1);
+    }
+
+    /// ⛔ A VALID PROFILE FOR THE WRONG TENANT MUST BE FATAL.
+    ///
+    /// This is the failure `config-url` introduced by naming a document instead of a query:
+    /// the fetch succeeds, the document parses, every other check passes, and the build runs
+    /// against somebody else's plane. Nothing downstream reports it.
+    #[test]
+    fn a_valid_profile_for_another_tenant_is_fatal() {
+        let p = Profile::parse(crate::protocol::SAMPLE.as_bytes()).unwrap();
+        let ctx = Context {
+            expect: Expect { tenant: Some("not-savvifi".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let f = identity_matches_request(&p, &ctx);
+        assert_eq!(f.len(), 1, "a wrong tenant must produce exactly one finding");
+        assert!(matches!(f[0].level, Level::Fatal), "wrong tenant must be FATAL, not a warning");
+        assert_eq!(f[0].code, "TBZL-IDENTITY-MISMATCH");
+    }
+
+    /// ⚠ AND AN UNASSERTED FIELD MUST NOT FIRE. `plane` and `config_version` are optional
+    /// inputs; asserting on their absence would fail every workflow that does not pin them.
+    #[test]
+    fn an_unasserted_field_asserts_nothing() {
+        let p = Profile::parse(crate::protocol::SAMPLE.as_bytes()).unwrap();
+        let ctx = Context {
+            expect: Expect { tenant: Some(p.tenant.clone()), ..Default::default() },
+            ..Default::default()
+        };
+        assert!(
+            identity_matches_request(&p, &ctx).is_empty(),
+            "matching tenant with unpinned plane/config_version must be clean"
+        );
     }
 
     #[test]

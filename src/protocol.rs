@@ -383,6 +383,32 @@ fn version_lt(a: &str, b: &str) -> bool {
     false
 }
 
+/// A minimal valid document, shared by the unit tests across this crate.
+///
+/// ⚠ Lives at module scope rather than inside `mod tests` so `verify`'s tests can use the same
+/// bytes. Two hand-maintained copies of a fixture drift, and the copy that drifts is always the
+/// one asserting the thing you care about.
+#[cfg(test)]
+pub(crate) const SAMPLE: &str = r#"{
+          "protocol": "tbzl.buildconfig/v1",
+          "config_version": "2026-08-05.1",
+          "tenant": "savvifi",
+          "plane": "tbzl-build-plane",
+          "facts": {
+            "runner_label": "tbzl-linux-x64",
+            "execution": {
+              "endpoint": "grpcs://rbe.tbzl.dev:8980",
+              "exec_properties": {"OSFamily": "linux"},
+              "advertised_platform": {"OSFamily": "linux"}
+            },
+            "auth": {
+              "token_url": "https://x.example/oauth2/token",
+              "scope": "fastverk-api/rbe:build",
+              "issuer": "https://issuer.example"
+            }
+          }
+        }"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

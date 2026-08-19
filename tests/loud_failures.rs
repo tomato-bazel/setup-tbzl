@@ -144,6 +144,9 @@ fn ctx<'a>(helper: &'a Path, env: Vec<(&str, String)>) -> Context<'a> {
         repo_bazelrc: None,
         runner_name: None,
         runner_environment: None,
+        // ⚠ Deliberately unasserted here. These tests exercise the OTHER checks; asserting an
+        // identity would make every one of them depend on the fixture's tenant string.
+        expect: Default::default(),
     }
 }
 
