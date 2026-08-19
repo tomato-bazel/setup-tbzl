@@ -71,6 +71,20 @@ inputs:
       ⏰ When `config.tbzl.dev` exists it serves a document at a stable URL and this input
       goes back to having a default; the protocol does not change.
     required: true
+  phase:
+    description: >-
+      `configure` (default) or `resolve`.
+      ⭐ USE `resolve` WHEN YOUR WORKFLOW MINTS ITS OWN RBE TOKEN. Minting needs the token URL and
+      the scope, which only the served profile knows — so the mint must run AFTER this Action;
+      but the credential probe is fatal before any token exists, so this Action could not run
+      first. `resolve` breaks that deadlock: it runs every check that does not need a credential
+      and exports `RBE_TOKEN_URL` / `RBE_TOKEN_SCOPE` for your minting step. Call the Action again
+      with the default `configure` afterwards, which runs the probe and writes the bazelrc.
+      ⛔ The credential check is DEFERRED, never skipped — no build starts without it passing.
+      ⚠ The second call reads the SAME document via the exported `TBZL_PROFILE`, so the two
+      phases cannot see different `config_version`s.
+    required: false
+    default: "configure"
   cache-root:
     description: >-
       Override `TBZL_CACHE_ROOT` — a directory SHARED by every executor on this host, holding
@@ -278,6 +292,16 @@ runs:
       run: |
         set -euo pipefail
         out="${RUNNER_TEMP}/tbzl-build-profile.json"
+        # ⭐ THE SECOND PHASE REUSES THE FIRST PHASE'S DOCUMENT, RATHER THAN RE-FETCHING IT.
+        # `resolve` exports TBZL_PROFILE. Fetching again would be a second request the platform is
+        # free to answer differently — it may have published a new config_version in between — and
+        # a build whose auth values came from one document and whose exec properties came from
+        # another is precisely the drift this Action exists to make unrepresentable.
+        if [ -n "${TBZL_PROFILE:-}" ] && [ -s "${TBZL_PROFILE}" ]; then
+          echo "::notice title=setup-tbzl::reusing the profile resolved earlier in this job (${TBZL_PROFILE})"
+          echo "path=${TBZL_PROFILE}" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         # ⚠ GitHub does NOT enforce `required: true` on composite-action inputs — an omitted
         # one arrives as the empty string and `curl ""` fails with a message about a URL
         # syntax error, which reads as a malformed URL rather than a missing one.
@@ -328,6 +352,7 @@ runs:
         # conditional, so the empty case is reachable, and the failure would appear only on
         # macOS as an error that names `flags` rather than anything a user configured.
         "${SETUP}" configure \
+          --phase "${PHASE}" \
           --profile "${PROFILE}" \
           --out "${RUNNER_TEMP}/tbzl" \
           --cred-helper "${HELPER}" \
@@ -343,6 +368,7 @@ runs:
         PIN: ${{ inputs.config-version }}
         CACHE_ROOT: ${{ inputs.cache-root }}
         OUTPUT_ROOT: ${{ inputs.output-root }}
+        PHASE: ${{ inputs.phase }}
         ALLOW_RC: ${{ inputs.allow-repo-bazelrc }}
         STRICT: ${{ inputs.strict }}
         SKIP_REACH: ${{ inputs.skip-reachability }}
