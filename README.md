@@ -191,10 +191,27 @@ Stated plainly, because a half-known gap is worse than a known one.
    its binary and says so explicitly instead of 404ing. `release.yml` publishes
    immutable `setuptbzl-<sha>` tags on merge to main; pin one there afterwards.
    Until then, build it and set `TBZL_SETUP_BIN`.
-1. **`config.tbzl.dev` does not exist.** Nothing is deployed. The Action fetches
-   from `inputs.config-url`, which today must point at a file or a release asset.
-   The service, and the publisher that renders a `ConfigSet` into this document,
-   are designed in `docs/autoconfigure.md` and not built.
+1. ⭐ **The profiles now ship as RELEASE ASSETS, and `config.tbzl.dev` is not needed.**
+   `docs/autoconfigure.md` corrected an earlier draft of this design: the profile
+   must **not** be a service. This Action fails loud by design, so a config service
+   being down would not degrade builds — it would **stop every build on the plane**.
+   A profile is a small, immutable, per-version document: an *artefact*, not a query.
+
+   Point `config-url` at an immutable release asset:
+
+   ```
+   https://github.com/tomato-bazel/setup-tbzl/releases/download/setuptbzl-<sha>/tbzl-boston.json
+   ```
+
+   ⛔ **Do not point it at `main`.** A `raw.githubusercontent` URL on a branch is
+   MUTABLE — editing the file silently changes every consumer's build flags with no
+   version to attribute the change to, which is exactly the "versioned, not
+   per-build adaptive" constraint that document sets.
+
+   ⏰ Still not built: the publisher that renders a `ConfigSet` from
+   `tbzl-control-plane`'s projection bundle into these documents. Today they are
+   hand-maintained fixtures, which is honest for two planes and does not scale to
+   per-tenant profiles.
 2. **No consumer is wired up.** `savvifi/aion` still carries its two endpoint
    configurations. Cutting it over is a separate change.
 3. **Exec-property agreement is only checked between the platform's own two
