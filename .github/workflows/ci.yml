@@ -293,7 +293,14 @@ jobs:
             # ⚠ `|| true`: a non-zero exit is EXPECTED here (there is no real profile). The
             # signal is the message, not the status.
             out=$("$dest" configure "$f" x --profile /nonexistent/profile.json 2>&1 || true)
-            if grep -q "unknown flag" <<<"$out"; then
+            # ⛔ MATCH THE FLAG BY NAME, NOT THE BARE PHRASE "unknown flag" — AND THIS IS NOT A
+            # NIT. Three of these flags are BOOLEAN (`--strict`, `--skip-reachability`,
+            # `--allow-repo-bazelrc`), so the `x` this probe appends is itself unknown and the
+            # binary answers `unknown flag "x"`. A bare grep therefore reports those three as
+            # broken against a PERFECTLY CORRECT pin — a check that is red no matter what, which
+            # gets muted and then catches nothing. Verified against both binaries: matching by
+            # name reports 5 stale flags for the old pin and zero for the new one.
+            if grep -qF "unknown flag \"$f\"" <<<"$out"; then
               echo "::error::the pinned binary (${TAG}) does not understand ${f}, which action.yml passes. Bump SETUP_TAG to a release that contains it."
               bad=1
             fi
