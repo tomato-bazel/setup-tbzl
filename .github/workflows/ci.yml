@@ -60,7 +60,7 @@ jobs:
     name: secret-scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           # ⛔ FULL HISTORY. A shallow clone scans only the tip, so a secret added in an
           # earlier commit of the branch and removed in a later one passes — while remaining
@@ -102,8 +102,8 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: bazel-contrib/setup-bazel@0.13.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: bazel-contrib/setup-bazel@663f88d97adf17db2523a5b385d9407a562e5551  # 0.13.0
         with:
           bazelisk-cache: true
           disk-cache: true
@@ -240,3 +240,70 @@ jobs:
           grep -q 'credential_helper=rbe.tbzl.dev=' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
           grep -q 'remote_executor=grpcs://rbe.tbzl.dev:8980' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
           ! grep -q 'fastverk.com' "${RUNNER_TEMP}/out2/tbzl.bazelrc"
+
+  # ⛔⛔ THE JOB THAT WOULD HAVE CAUGHT A BROKEN ACTION ON main, AND WHOSE ABSENCE LET ONE SHIP.
+  #
+  # Every step in `test` above execs `$TBZL_SETUP_BIN` — a binary built from THIS commit. That is
+  # deliberate and right: it stops a release shipping against last week's code. But it means the
+  # PIN in `action.yml` is exercised by NOBODY. A consumer does not get the freshly built binary;
+  # it gets whatever `SETUP_TAG` names.
+  #
+  # On 2026-08-19 that gap shipped a main where `action.yml` passed `--expect-tenant` to a pinned
+  # binary published BEFORE that flag existed. Every check above was green, because none of them
+  # ran the pinned binary:
+  #
+  #   ::error title=setup-tbzl::unknown flag "--expect-tenant"
+  #
+  # ⭐ The assertion is deliberately about FLAG PARSING, not about a successful configure. Parsing
+  # happens before anything else, so a bogus `--profile` still proves the flag is understood — and
+  # that keeps this job free of fixtures, tokens and a credential helper, which is what stops it
+  # rotting into another happy-path test.
+  pinned-binary-understands-the-action:
+    name: the pinned binary understands action.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Every flag action.yml passes must be known to the pinned binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(sed -n 's/^ *SETUP_TAG: *\(.*\)$/\1/p' action.yml | head -1)
+          [ -n "$TAG" ] || { echo "::error::could not read SETUP_TAG from action.yml"; exit 1; }
+          echo "::notice::action.yml pins ${TAG}"
+
+          dest="${RUNNER_TEMP}/pinned"
+          curl -sSL --fail-with-body --retry 3 -o "$dest" \
+            "https://github.com/tomato-bazel/setup-tbzl/releases/download/${TAG}/tbzl-setup-linux-amd64"
+          chmod +x "$dest"
+
+          # The flags the Action actually passes: the fixed ones on the `configure` line, plus
+          # every conditional `flags+=(--x)`. Derived from action.yml so a flag added there
+          # without bumping the pin fails HERE rather than at a consumer.
+          mapfile -t FLAGS < <(
+            { grep -oE 'flags\+=\(--[a-z-]+' action.yml | sed 's/flags+=(//'
+              grep -oE '^ +--[a-z-]+ "\$\{' action.yml | grep -oE '\--[a-z-]+'
+            } | sort -u
+          )
+          [ "${#FLAGS[@]}" -gt 0 ] || { echo "::error::extracted NO flags from action.yml — the parser above is broken, and an empty list would pass this job while checking nothing"; exit 1; }
+          echo "::notice::checking ${#FLAGS[@]} flags: ${FLAGS[*]}"
+
+          bad=0
+          for f in "${FLAGS[@]}"; do
+            # ⚠ `|| true`: a non-zero exit is EXPECTED here (there is no real profile). The
+            # signal is the message, not the status.
+            out=$("$dest" configure "$f" x --profile /nonexistent/profile.json 2>&1 || true)
+            # ⛔ MATCH THE FLAG BY NAME, NOT THE BARE PHRASE "unknown flag" — AND THIS IS NOT A
+            # NIT. Three of these flags are BOOLEAN (`--strict`, `--skip-reachability`,
+            # `--allow-repo-bazelrc`), so the `x` this probe appends is itself unknown and the
+            # binary answers `unknown flag "x"`. A bare grep therefore reports those three as
+            # broken against a PERFECTLY CORRECT pin — a check that is red no matter what, which
+            # gets muted and then catches nothing. Verified against both binaries: matching by
+            # name reports 5 stale flags for the old pin and zero for the new one.
+            if grep -qF "unknown flag \"$f\"" <<<"$out"; then
+              echo "::error::the pinned binary (${TAG}) does not understand ${f}, which action.yml passes. Bump SETUP_TAG to a release that contains it."
+              bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ] || exit 1
+          echo "::notice::${TAG} understands every flag action.yml passes"
