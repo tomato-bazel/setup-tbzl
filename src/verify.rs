@@ -124,7 +124,7 @@ pub fn without_credentials(profile: &Profile, ctx: &Context<'_>) -> Vec<Finding>
     f.extend(local_fallback_is_off(profile));
     f.extend(platform_agreement(profile));
     f.extend(no_shadow_config(profile, ctx));
-    f.extend(no_competing_bazelrc(ctx));
+    f.extend(no_competing_bazelrc(profile, ctx));
     f.extend(plane_matches_runner(profile, ctx));
     f.extend(identity_matches_request(profile, ctx));
     f.extend(output_base_survives_the_build(ctx));
@@ -585,22 +585,55 @@ fn no_shadow_config(profile: &Profile, ctx: &Context<'_>) -> Vec<Finding> {
 /// KILL. Bazel applies rc flags before the command line for the same option, so a generated
 /// bazelrc usually wins — but `--remote_default_exec_properties` ACCUMULATES rather than
 /// replacing, and two `container-image` entries produce a platform nobody advertises.
-fn no_competing_bazelrc(ctx: &Context<'_>) -> Vec<Finding> {
+fn no_competing_bazelrc(profile: &Profile, ctx: &Context<'_>) -> Vec<Finding> {
     let Some(rc) = &ctx.repo_bazelrc else {
         return vec![];
     };
+    let ours = profile.credential_hosts();
     let mut hits = Vec::new();
     for line in rc.lines() {
         let l = line.trim();
         if l.starts_with('#') {
             continue;
         }
+        // ⛔ `--credential_helper` IS HOST-KEYED, AND TREATING IT AS A BARE FLAG WAS A FALSE
+        // POSITIVE THAT WOULD HAVE BLOCKED REAL CONSUMERS. `savvifi/expression` declares
+        //
+        //     common --credential_helper=github.com=%workspace%/tools/credhelper/gh-cred-helper.sh
+        //     common --credential_helper=api.github.com=…
+        //
+        // for SOURCE FETCHING. Those cannot conflict with a helper registered for
+        // `boston.rbe.tbzl.dev`, because bazel dispatches on the host. Flagging them anyway left
+        // one escape — `allow-repo-bazelrc: true` — which disables this check ENTIRELY, including
+        // for `--remote_default_exec_properties`, the flag that genuinely ACCUMULATES and queues
+        // every action against a platform no worker advertises. A false positive whose only
+        // workaround switches off the true positive is worse than no check.
+        //
+        // ⚠ AN UNSCOPED HELPER IS STILL A CONFLICT, and that case is live too: `fastverk/botnoc`
+        // declares `--credential_helper=%workspace%/tools/credhelper/...` with no host at all,
+        // which bazel applies to EVERY host — including ours. Absence of a host is the dangerous
+        // form, not the safe one.
+        if let Some(rest) = l.split("--credential_helper=").nth(1) {
+            let value = rest.split_whitespace().next().unwrap_or("");
+            match value.split_once('=') {
+                // Host-keyed: only a collision on a host WE register is a conflict.
+                Some((host, _)) => {
+                    if ours.iter().any(|h| h == host) {
+                        hits.push(format!("--credential_helper for {host} ({l})"));
+                    }
+                }
+                // No host: applies to everything, including our endpoint.
+                None => hits.push(format!(
+                    "--credential_helper with NO host key ({l}) — bazel applies it to every host, \
+                     including this plane's"
+                )),
+            }
+        }
         for flag in [
             "--remote_executor",
             "--remote_cache",
             "--remote_default_exec_properties",
             "--remote_instance_name",
-            "--credential_helper",
         ] {
             if l.contains(flag) {
                 hits.push(format!("{flag} ({l})"));
@@ -880,5 +913,84 @@ mod phase_tests {
             codes.contains(&"TBZL-IDENTITY-MISMATCH"),
             "resolve must still catch a wrong document; got {codes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_helper_scope_tests {
+    use super::*;
+    use crate::protocol::Profile;
+
+    fn sample() -> Profile {
+        Profile::parse(crate::protocol::SAMPLE.as_bytes()).unwrap()
+    }
+
+    /// ⛔ THE FALSE POSITIVE THAT WOULD HAVE BLOCKED savvifi/expression.
+    ///
+    /// Its .bazelrc registers helpers for `github.com` and `api.github.com` to fetch SOURCE.
+    /// Bazel dispatches `--credential_helper` on the HOST, so those cannot collide with a helper
+    /// registered for the RBE endpoint. Flagging them left one escape — `allow-repo-bazelrc:
+    /// true` — which disables this check entirely, INCLUDING for the flag that genuinely
+    /// accumulates. A false positive whose only workaround switches off the true positive is
+    /// worse than no check at all.
+    #[test]
+    fn a_helper_for_another_host_is_not_a_conflict() {
+        let ctx = Context {
+            repo_bazelrc: Some(
+                "common --credential_helper=github.com=%workspace%/tools/credhelper/gh.sh\n\
+                 common --credential_helper=api.github.com=%workspace%/tools/credhelper/gh.sh\n"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            no_competing_bazelrc(&sample(), &ctx).is_empty(),
+            "helpers for github.com must not be reported against an rbe.tbzl.dev plane"
+        );
+    }
+
+    /// ⛔ BUT A HELPER FOR *OUR* HOST IS, and dropping that would gut the check.
+    #[test]
+    fn a_helper_for_our_own_host_is_a_conflict() {
+        let ctx = Context {
+            repo_bazelrc: Some("common --credential_helper=rbe.tbzl.dev=/somewhere/else\n".into()),
+            ..Default::default()
+        };
+        let f = no_competing_bazelrc(&sample(), &ctx);
+        assert_eq!(f.len(), 1, "a helper registered for this plane's host must be reported");
+        assert_eq!(f[0].code, "TBZL-RC-CONFLICT");
+    }
+
+    /// ⛔ AND AN UNSCOPED HELPER IS THE DANGEROUS FORM — `fastverk/botnoc` has exactly this.
+    /// With no host key bazel applies it to EVERY host, including ours, so absence of a host is
+    /// a conflict rather than an exemption.
+    #[test]
+    fn an_unscoped_helper_is_a_conflict() {
+        let ctx = Context {
+            repo_bazelrc: Some(
+                "common --credential_helper=%workspace%/tools/credhelper/fastverk-cred-helper\n"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let f = no_competing_bazelrc(&sample(), &ctx);
+        assert_eq!(f.len(), 1, "an unscoped helper applies to every host and must be reported");
+        assert!(
+            f[0].message.contains("NO host key"),
+            "the message must say WHY an unscoped helper conflicts, got: {}",
+            f[0].message
+        );
+    }
+
+    /// ⚠ The non-host-keyed flags are unaffected — they conflict regardless.
+    #[test]
+    fn the_accumulating_flag_is_still_caught() {
+        let ctx = Context {
+            repo_bazelrc: Some(
+                "build --remote_default_exec_properties=container-image=docker://x\n".into(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(no_competing_bazelrc(&sample(), &ctx).len(), 1);
     }
 }
