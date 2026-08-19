@@ -385,3 +385,139 @@ mod tests {
             .contains(&("FASTVERK_TOKEN_FILE_CACHE_TBZL_DEV".into(), "/t".into())));
     }
 }
+
+/// Fences around the block setup-tbzl owns inside `$HOME/.bazelrc`.
+///
+/// ⛔ THE FILE IS NOT OURS TO REPLACE, AND THAT IS NOT HYPOTHETICAL IN EITHER DIRECTION. A
+/// developer's `~/.bazelrc` on this estate carried a `--remote_cache` line that split the cache
+/// and executor legs of an RBE build and cost an afternoon — so its contents matter. And a
+/// GITHUB-HOSTED RUNNER SHIPS ITS OWN `~/.bazelrc`: an earlier version of this code refused to
+/// touch a file it had not written, which failed setup-tbzl's own CI on the first hosted run
+/// and would have failed every consumer on a hosted runner.
+///
+/// So: own a fenced block, rewrite only that block, leave everything else byte-identical, and
+/// be idempotent across re-runs.
+pub const BLOCK_BEGIN: &str = "# >>> setup-tbzl layout >>>";
+pub const BLOCK_END: &str = "# <<< setup-tbzl layout <<<";
+
+/// Flags whose meaning setup-tbzl owns. An existing line setting one of these OUTSIDE our block
+/// is a real conflict — the home rc is read after the repo's `.bazelrc`, so whichever of us
+/// wins, the other's intent is silently discarded.
+pub const OWNED_FLAGS: &[&str] =
+    &["output_user_root", "repository_cache", "repo_contents_cache", "disk_cache"];
+
+/// Replace (or append) our fenced block inside `prev`, leaving the rest untouched.
+pub fn splice_block(prev: &str, block: &str) -> Result<String, String> {
+    // Drop any previous block of ours first, so re-running is idempotent rather than additive.
+    let (before, after) = match (prev.find(BLOCK_BEGIN), prev.find(BLOCK_END)) {
+        (Some(a), Some(b)) if b > a => (&prev[..a], &prev[b + BLOCK_END.len()..]),
+        // ⚠ A begin without an end means someone edited inside the fences and truncated them.
+        // Rewriting from a guessed boundary could delete their lines, so stop instead.
+        (Some(_), _) => {
+            return Err(format!(
+                "$HOME/.bazelrc contains `{BLOCK_BEGIN}` with no matching `{BLOCK_END}`. The \
+                 block setup-tbzl owns cannot be located, and guessing where it ends risks \
+                 deleting lines that are not ours. Repair or remove the fences by hand"
+            ))
+        }
+        _ => (prev, ""),
+    };
+
+    let foreign = format!("{before}{after}");
+    // ⛔ A conflicting flag OUTSIDE our fences is fatal. Silently winning would discard a
+    // setting someone made on purpose, and this file overrides the repository's own .bazelrc.
+    for flag in OWNED_FLAGS {
+        for line in foreign.lines() {
+            let l = line.trim();
+            if !l.starts_with('#') && l.contains(flag) {
+                return Err(format!(
+                    "$HOME/.bazelrc already sets `{flag}` outside setup-tbzl's block:\n    {l}\n\
+                     setup-tbzl manages that flag, and a home bazelrc overrides the repository's \
+                     own .bazelrc — so one of the two settings would silently lose. Remove that \
+                     line, or pass --no-home-bazelrc and configure the layout yourself"
+                ));
+            }
+        }
+    }
+
+    let mut out = foreign.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(BLOCK_BEGIN);
+    out.push('\n');
+    out.push_str(block.trim_end());
+    out.push('\n');
+    out.push_str(BLOCK_END);
+    out.push('\n');
+    Ok(out)
+}
+
+#[cfg(test)]
+mod home_rc_tests {
+    use super::*;
+
+    /// ⛔ THE FAILURE THAT BROKE THIS ACTION'S OWN CI. A GitHub-hosted runner SHIPS a
+    /// `~/.bazelrc`. An earlier version refused to touch any file it had not written, which
+    /// failed on the first hosted run and would have failed every consumer on a hosted runner.
+    /// Pre-existing content must survive byte-for-byte.
+    #[test]
+    fn a_pre_existing_home_bazelrc_survives_intact() {
+        let prev = "build --announce_rc\nbuild --color=yes\n";
+        let out = splice_block(prev, "startup --output_user_root=/w/.bazelroot").unwrap();
+        assert!(out.contains("build --announce_rc"), "foreign line was lost:\n{out}");
+        assert!(out.contains("build --color=yes"), "foreign line was lost:\n{out}");
+        assert!(out.contains("startup --output_user_root=/w/.bazelroot"));
+    }
+
+    /// ⚠ IDEMPOTENT. setup-tbzl runs at the head of every job, and on a runner with a persistent
+    /// home an additive write would grow the file without bound and leave STALE paths above the
+    /// current ones — where, bazelrc being last-wins, the newest would win by luck of ordering.
+    #[test]
+    fn re_running_replaces_the_block_rather_than_appending() {
+        let prev = "build --color=yes\n";
+        let once = splice_block(prev, "startup --output_user_root=/a").unwrap();
+        let twice = splice_block(&once, "startup --output_user_root=/b").unwrap();
+        assert_eq!(twice.matches(BLOCK_BEGIN).count(), 1, "block duplicated:\n{twice}");
+        assert!(!twice.contains("/a"), "the stale path survived:\n{twice}");
+        assert!(twice.contains("/b"));
+        assert!(twice.contains("build --color=yes"), "foreign line lost on re-run");
+        // And a third run with identical input is a no-op.
+        let thrice = splice_block(&twice, "startup --output_user_root=/b").unwrap();
+        assert_eq!(twice, thrice, "not stable: a no-op run changed the file");
+    }
+
+    /// ⛔ A REAL CONFLICT IS FATAL. The home rc overrides the repository's own .bazelrc, so if
+    /// someone already set a flag we manage, one of the two intents is discarded silently.
+    #[test]
+    fn a_conflicting_flag_outside_the_block_is_refused() {
+        let prev = "build --disk_cache=/somewhere/else\n";
+        let err = splice_block(prev, "build --disk_cache=/bazel-cache/disk").unwrap_err();
+        assert!(err.contains("disk_cache"), "the error must name the flag, got: {err}");
+    }
+
+    /// ⚠ A COMMENTED-OUT FLAG IS NOT A CONFLICT. Refusing on it would fail on any file whose
+    /// author documented the option, which is common and harmless.
+    #[test]
+    fn a_commented_flag_is_not_a_conflict() {
+        let prev = "# build --disk_cache=/somewhere/else\n";
+        assert!(splice_block(prev, "build --disk_cache=/x").is_ok());
+    }
+
+    /// ⚠ TRUNCATED FENCES STOP RATHER THAN GUESS. Rewriting from a guessed boundary could
+    /// delete lines that are not ours.
+    #[test]
+    fn an_unterminated_block_is_refused_rather_than_repaired() {
+        let prev = format!("{BLOCK_BEGIN}\nstartup --output_user_root=/a\n");
+        let err = splice_block(&prev, "startup --output_user_root=/b").unwrap_err();
+        assert!(err.contains("no matching"), "got: {err}");
+    }
+
+    /// An empty/absent home rc is the ordinary laptop case.
+    #[test]
+    fn an_absent_file_just_gets_the_block() {
+        let out = splice_block("", "startup --output_user_root=/w").unwrap();
+        assert!(out.starts_with(BLOCK_BEGIN), "got:\n{out}");
+        assert!(out.trim_end().ends_with(BLOCK_END));
+    }
+}
