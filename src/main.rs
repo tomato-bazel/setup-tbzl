@@ -25,7 +25,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use tbzl_setup::{protocol::Profile, render, verify};
+use tbzl_setup::{layout, protocol::Profile, render, verify};
 
 fn main() -> std::process::ExitCode {
     match run() {
@@ -50,6 +50,13 @@ struct Args {
     strict: bool,
     /// What the caller believes it fetched. See `verify::Expect`.
     expect: verify::Expect,
+    /// Override `TBZL_CACHE_ROOT` / `TBZL_OUTPUT_ROOT` from the command line.
+    cache_root: Option<String>,
+    output_root: Option<String>,
+    /// Where to write the executor's layout rc. Defaults to `$HOME/.bazelrc`.
+    home_bazelrc: Option<PathBuf>,
+    /// Skip writing it entirely.
+    no_home_bazelrc: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -63,6 +70,10 @@ fn parse_args() -> Result<Args, String> {
         skip_reachability: false,
         strict: false,
         expect: verify::Expect::default(),
+        cache_root: None,
+        output_root: None,
+        home_bazelrc: None,
+        no_home_bazelrc: false,
     };
     let mut it = std::env::args().skip(1);
     // ⚠ The subcommand is required and lenient parsing is deliberately NOT offered. The
@@ -86,6 +97,14 @@ fn parse_args() -> Result<Args, String> {
             "--expect-tenant" => a.expect.tenant = Some(val()?),
             "--expect-plane" => a.expect.plane = Some(val()?),
             "--expect-config-version" => a.expect.config_version = Some(val()?),
+            // ⚠ OVERRIDES FOR THE LAYOUT CONVENTION, and they are FLAGS rather than step env
+            // for a specific reason: a GitHub Action input that is not supplied renders as the
+            // EMPTY STRING, and putting that in the step's `env:` would mask a value the runner
+            // itself had set. A flag that is simply absent cannot do that.
+            "--cache-root" => a.cache_root = Some(val()?),
+            "--output-root" => a.output_root = Some(val()?),
+            "--home-bazelrc" => a.home_bazelrc = Some(PathBuf::from(val()?)),
+            "--no-home-bazelrc" => a.no_home_bazelrc = true,
             "--allow-repo-bazelrc" => a.allow_repo_bazelrc = true,
             "--skip-reachability" => a.skip_reachability = true,
             "--strict" => a.strict = true,
@@ -122,6 +141,31 @@ fn run() -> Result<(), String> {
 
     // ── 2. verification ──────────────────────────────────────────────────────────────────
     let env: Vec<(String, String)> = std::env::vars().collect();
+
+    // ── the executor's storage layout ────────────────────────────────────────────────────
+    // ⭐ RESOLVED FROM THE RUNNER, NOT FROM THE PROFILE. The plane says which cache tiers are
+    // worth enabling; where this executor has disk is its own property. See `layout`.
+    //
+    // ⛔ A failure here is fatal and not a fall-back to bazel's defaults: the arrangements
+    // `resolve` rejects (a shared output base, a cache under the output base) fail SILENTLY at
+    // build time — as slowness, or as `bazel clean` deleting the fleet's cache — so the only
+    // place they can be caught is before the build starts.
+    // ⚠ A flag beats the runner's environment, and does so by REPLACING the entry rather than
+    // being appended — `resolve` reads the first match, so appending would silently lose.
+    let mut layout_env = env.clone();
+    for (var, over) in [
+        (layout::CACHE_ROOT_VAR, &args.cache_root),
+        (layout::OUTPUT_ROOT_VAR, &args.output_root),
+    ] {
+        if let Some(v) = over {
+            layout_env.retain(|(n, _)| n != var);
+            layout_env.push((var.to_string(), v.clone()));
+        }
+    }
+    let layout = layout::resolve(&layout_env)?;
+    for note in &layout.provenance {
+        println!("::notice title=setup-tbzl::{note}");
+    }
     let cred_helper = args.cred_helper.clone();
     let repo_rc = args
         .repo_bazelrc
@@ -147,6 +191,8 @@ fn run() -> Result<(), String> {
         runner_name: std::env::var("RUNNER_NAME").ok(),
         runner_environment: std::env::var("RUNNER_ENVIRONMENT").ok(),
         expect: args.expect.clone(),
+        layout: layout.clone(),
+        home: std::env::var("HOME").ok(),
     };
 
     let mut findings = verify::all(&profile, &ctx);
@@ -194,6 +240,42 @@ fn run() -> Result<(), String> {
     let rc_path = args.out.join("tbzl.bazelrc");
     std::fs::write(&rc_path, &rendered.bazelrc)
         .map_err(|e| format!("cannot write {}: {e}", rc_path.display()))?;
+
+    // ── the executor's layout rc ─────────────────────────────────────────────────────────
+    // ⭐ THIS IS WHAT LETS CONSUMERS STOP TRANSCRIBING. bazel reads the home rc on EVERY
+    // invocation, so `bazel query` in some later step gets the same output base and caches as
+    // the build without the workflow threading anything through.
+    if !args.no_home_bazelrc {
+        let path = args
+            .home_bazelrc
+            .clone()
+            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".bazelrc")));
+        match path {
+            None => println!(
+                "::warning title=setup-tbzl::$HOME is unset, so no layout bazelrc was written. \
+                 Every bazel invocation will use its own defaults"
+            ),
+            Some(p) => {
+                let body = render::render_home(&layout, &profile.recommendations.caches);
+                // ⛔ SPLICE, DO NOT CLOBBER. A GitHub-hosted runner already ships a ~/.bazelrc,
+                // and a developer's own is where a --remote_cache line once split an RBE
+                // build's two legs. Only the fenced block is ours; everything else survives
+                // byte-for-byte, and re-running replaces the block rather than appending.
+                let prev = std::fs::read_to_string(&p).unwrap_or_default();
+                let next = render::splice_block(&prev, &body)?;
+                std::fs::write(&p, &next)
+                    .map_err(|e| format!("cannot write {}: {e}", p.display()))?;
+                println!(
+                    "::notice title=setup-tbzl::updated the setup-tbzl block in {} — every bazel \
+                     invocation in this job now shares one output base and the host's caches, \
+                     with no per-step flags. {} bytes of pre-existing configuration were left \
+                     untouched",
+                    p.display(),
+                    prev.len()
+                );
+            }
+        }
+    }
 
     append_kv("GITHUB_ENV", &rendered.env)?;
     append_kv(

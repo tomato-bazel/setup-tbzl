@@ -62,6 +62,10 @@ pub struct Context<'a> {
     pub runner_environment: Option<String>,
     /// What the workflow ASKED FOR, to be checked against what the document turned out to be.
     pub expect: Expect,
+    /// Where this executor keeps bazel state, resolved from the runner. See `crate::layout`.
+    pub layout: crate::layout::Layout,
+    /// `$HOME`, for deciding whether the output base is on the container's writable layer.
+    pub home: Option<String>,
 }
 
 /// The identity the caller believes it fetched.
@@ -89,7 +93,7 @@ pub struct Expect {
 /// ⚠ A CONSTANT, AND IT MUST BE UPDATED WITH THE LIST BELOW. `checks_are_all_counted` fails if
 /// it drifts. The alternative — reporting `findings.len()` — announced "0 checks passed" on a
 /// clean run, which reads as "nothing was checked".
-pub const CHECK_COUNT: usize = 8;
+pub const CHECK_COUNT: usize = 9;
 
 /// Run every check that does not need the network.
 ///
@@ -105,7 +109,64 @@ pub fn all(profile: &Profile, ctx: &Context<'_>) -> Vec<Finding> {
     f.extend(plane_matches_runner(profile, ctx));
     f.extend(credential_round_trip(profile, ctx));
     f.extend(identity_matches_request(profile, ctx));
+    f.extend(output_base_survives_the_build(ctx));
     f
+}
+
+// ── V8 ────────────────────────────────────────────────────────────────────────────────────
+/// ⛔ THE OUTPUT BASE IS ON THE CONTAINER'S WRITABLE LAYER, AND THE BUILD WILL BE EVICTED.
+///
+/// This is the check for the failure of 2026-08-19, written from it. Bazel defaults
+/// `--output_user_root` to `$HOME/.cache/bazel`; in a container that IS the writable layer,
+/// which is exactly what a pod's `ephemeral-storage` limit governs. Measured at 7.1 GiB for one
+/// repo against an 8Gi limit.
+///
+/// ⭐ AND THE SYMPTOM NAMED NOTHING. ARC replaced each evicted pod, GitHub kept the run
+/// `in_progress` rather than failing it, and the eviction message lived on pod objects that were
+/// garbage-collected — so it presented as "the build is not advancing", against an idle node,
+/// with the evidence already gone. A preflight check is the only place this is cheap to see.
+///
+/// ⚠ FATAL ONLY ON A SELF-HOSTED RUNNER. On a laptop the default output base is correct and
+/// this must not fail; `RUNNER_ENVIRONMENT` is the same signal `plane_matches_runner` uses. On a
+/// GitHub-hosted runner the writable layer is a normal disk, so it is a warning at most.
+fn output_base_survives_the_build(ctx: &Context<'_>) -> Vec<Finding> {
+    let self_hosted = ctx.runner_environment.as_deref() == Some("self-hosted");
+
+    let Some(root) = &ctx.layout.output_root else {
+        // Unset: bazel falls back to $HOME/.cache/bazel.
+        if !self_hosted {
+            return vec![];
+        }
+        return vec![Finding::fatal(
+            "TBZL-OUTPUT-BASE-EPHEMERAL",
+            format!(
+                "{} is not set on this self-hosted runner, so bazel will put its output base \
+                 under $HOME/.cache/bazel — the container's writable layer, which is what the \
+                 pod's ephemeral-storage limit governs. That evicted every runner on this plane \
+                 mid-build, and it does NOT surface as a failure: the pod is replaced, the run \
+                 stays in_progress, and the eviction message is garbage-collected with the pod. \
+                 Set {} on the runner to a path on a volume",
+                crate::layout::OUTPUT_ROOT_VAR,
+                crate::layout::OUTPUT_ROOT_VAR
+            ),
+        )];
+    };
+
+    // Set, but pointed back at the very place it exists to avoid.
+    if crate::layout::looks_like_writable_layer(root, ctx.home.as_deref()) {
+        let level = if self_hosted { Finding::fatal } else { Finding::warn };
+        return vec![level(
+            "TBZL-OUTPUT-BASE-EPHEMERAL",
+            format!(
+                "{}={} is under $HOME/.cache, which in a container is the writable layer bounded \
+                 by ephemeral-storage. Setting the variable to the location it exists to avoid \
+                 is worse than leaving it unset, because it reads as configured",
+                crate::layout::OUTPUT_ROOT_VAR,
+                root.display()
+            ),
+        )];
+    }
+    vec![]
 }
 
 // ── V7 ────────────────────────────────────────────────────────────────────────────────────
@@ -637,11 +698,11 @@ pub fn endpoint_reachable(endpoint: &str, timeout: std::time::Duration) -> Vec<F
 mod tests {
     use super::*;
 
-    /// ⚠ Guards the reported count against the actual one. Seven checks in `all`, plus
+    /// ⚠ Guards the reported count against the actual one. Eight checks in `all`, plus
     /// `endpoint_reachable`.
     #[test]
     fn checks_are_all_counted() {
-        assert_eq!(CHECK_COUNT, 7 + 1);
+        assert_eq!(CHECK_COUNT, 8 + 1);
     }
 
     /// ⛔ A VALID PROFILE FOR THE WRONG TENANT MUST BE FATAL.
@@ -660,6 +721,64 @@ mod tests {
         assert_eq!(f.len(), 1, "a wrong tenant must produce exactly one finding");
         assert!(matches!(f[0].level, Level::Fatal), "wrong tenant must be FATAL, not a warning");
         assert_eq!(f[0].code, "TBZL-IDENTITY-MISMATCH");
+    }
+
+    /// ⛔ THE 2026-08-19 EVICTION, AS A TEST.
+    ///
+    /// An unset output root on a self-hosted runner means bazel writes its output base into the
+    /// container's writable layer, which `ephemeral-storage` bounds. Nothing downstream reports
+    /// it: the pod is replaced, the run stays `in_progress`, the evidence is collected.
+    #[test]
+    fn an_unset_output_root_on_a_self_hosted_runner_is_fatal() {
+        let ctx = Context { runner_environment: Some("self-hosted".into()), ..Default::default() };
+        let f = output_base_survives_the_build(&ctx);
+        assert_eq!(f.len(), 1, "an unset output root on a fleet runner must be reported");
+        assert!(matches!(f[0].level, Level::Fatal), "it evicts the build; a warning is too quiet");
+        assert_eq!(f[0].code, "TBZL-OUTPUT-BASE-EPHEMERAL");
+    }
+
+    /// ⚠ AND IT MUST NOT FIRE ON A LAPTOP, where bazel's default output base is exactly right.
+    /// A check that fails on correct configurations gets disabled, and then catches nothing.
+    #[test]
+    fn an_unset_output_root_off_a_fleet_runner_is_quiet() {
+        assert!(output_base_survives_the_build(&Context::default()).is_empty());
+    }
+
+    /// ⛔ SET, BUT POINTED AT THE PLACE IT EXISTS TO AVOID — worse than unset, because it reads
+    /// as configured to anyone auditing the runner.
+    #[test]
+    fn an_output_root_under_home_cache_is_still_fatal() {
+        let ctx = Context {
+            runner_environment: Some("self-hosted".into()),
+            home: Some("/home/runner".into()),
+            layout: crate::layout::Layout {
+                output_root: Some("/home/runner/.cache/bazel".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let f = output_base_survives_the_build(&ctx);
+        assert_eq!(f.len(), 1, "pointing the variable at the writable layer must be caught");
+        assert!(matches!(f[0].level, Level::Fatal));
+    }
+
+    /// ⭐ THE CORRECT ARRANGEMENT IS SILENT. Without this the three tests above would pass on a
+    /// check that simply always fires.
+    #[test]
+    fn an_output_root_on_a_volume_is_accepted() {
+        let ctx = Context {
+            runner_environment: Some("self-hosted".into()),
+            home: Some("/home/runner".into()),
+            layout: crate::layout::Layout {
+                output_root: Some("/home/runner/_work/.bazelroot".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            output_base_survives_the_build(&ctx).is_empty(),
+            "a correctly configured runner must produce no finding"
+        );
     }
 
     /// ⚠ AND AN UNASSERTED FIELD MUST NOT FIRE. `plane` and `config_version` are optional

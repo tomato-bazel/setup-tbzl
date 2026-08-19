@@ -35,6 +35,7 @@
 pub mod credprobe;
 pub mod hostkey;
 pub mod jwt;
+pub mod layout;
 pub mod protocol;
 pub mod redact;
 pub mod render;
