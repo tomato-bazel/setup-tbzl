@@ -92,7 +92,19 @@ jobs:
           file tbzl-setup-darwin-arm64 | grep -q 'Mach-O.*arm64' \
             || { echo "::error::darwin artifact is not an arm64 Mach-O"; exit 1; }
 
-          shasum -a 256 tbzl-setup-* > tbzl-setup-sha256.txt
+          # ⭐ THE BUILD PROFILES SHIP AS RELEASE ASSETS, WHICH IS THE WHOLE DELIVERY
+          # MECHANISM. docs/autoconfigure.md is explicit that the profile must NOT be a
+          # service: `setup-tbzl` fails loud by design, so a config service being down would
+          # not degrade builds — it would STOP EVERY BUILD ON THE PLANE. A profile is a small
+          # immutable per-version document; it is an ARTEFACT, not a query.
+          #
+          # ⛔ AND SERVING IT FROM `main` WOULD BE WORSE THAN A SERVICE. A raw.githubusercontent
+          # URL on a branch is MUTABLE: editing the file silently changes every consumer's
+          # build flags with no version to attribute the change to, which is exactly the
+          # "versioned, not per-build adaptive" constraint that document sets. Pinned to an
+          # immutable tag, a recommendation change is a deliberate bump.
+          cp tests/fixtures/tbzl-*.json .
+          shasum -a 256 tbzl-setup-* tbzl-*.json > tbzl-setup-sha256.txt
           cat tbzl-setup-sha256.txt
 
       # ⭐ THE PINNED TAG IN action.yml MUST NAME A RELEASE THAT EXISTS, and the only way to
@@ -110,7 +122,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt"
+          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt tbzl-boston.json tbzl-build-plane.json"
           # ⚠ View-then-act rather than `create || upload`: `gh release create` fails
           # confusingly when the tag exists remotely but not locally.
           if gh release view setuptbzl-latest >/dev/null 2>&1; then
@@ -129,7 +141,7 @@ jobs:
           set -euo pipefail
           SHA="${GITHUB_SHA:0:12}"
           TAG="setuptbzl-${SHA}"
-          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt"
+          FILES="tbzl-setup-darwin-arm64 tbzl-setup-linux-amd64 tbzl-setup-linux-arm64 tbzl-setup-sha256.txt tbzl-boston.json tbzl-build-plane.json"
           # ⛔ NEVER re-upload to an existing immutable tag. action.yml verifies (url, sha256)
           # against it, so a consumer would start failing its checksum with no change on its
           # side — and the message would name a corrupt download.
