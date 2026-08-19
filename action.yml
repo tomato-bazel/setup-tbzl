@@ -40,26 +40,37 @@ branding:
 
 inputs:
   tenant:
-    description: "Tenant slug, e.g. `savvifi`. The only value a workflow author should have to know."
+    description: >-
+      Tenant slug, e.g. `savvifi`. ⛔ ASSERTED AGAINST THE FETCHED DOCUMENT, NOT USED TO FIND
+      IT. A `config-url` copied from another repo returns HTTP 200 and a perfectly valid
+      profile — it is simply someone else's — and every other check in this Action passes on
+      it, because nothing about it is malformed. This input is what makes that fatal.
     required: true
   plane:
-    description: "Plane to build on. Omit to take the tenant's default."
+    description: >-
+      Plane the profile must declare, e.g. `tbzl-boston`. Omit to accept whichever plane the
+      document names. ⚠ Asserted, like `tenant`; it does not select anything.
     required: false
     default: ""
   config-version:
     description: >-
-      Pin a specific published recommendation instead of the tenant's current one.
+      Require the document to be a specific published recommendation.
       ⭐ Use this to bisect a performance regression: the knobs are versioned precisely so a
-      change to them is attributable and reversible. Omit for the current version.
+      change to them is attributable and reversible. Omit to accept the served version.
+      ⚠ Asserted, not selected — pin the URL to pin the document.
     required: false
     default: ""
   config-url:
     description: >-
-      Base URL of the build-config service. ⏰ `config.tbzl.dev` does not exist yet — see
-      README, "What this does not solve". Point it at a release asset or a file:// URL to
-      exercise the Action today.
-    required: false
-    default: "https://config.tbzl.dev"
+      URL of the build profile document itself — not a service base. It is fetched verbatim,
+      so a GitHub release asset, an S3 object or a `file://` path all work unchanged.
+      ⭐ A PLAIN DOCUMENT IS THE POINT: the profile is an ARTEFACT, so it can be published,
+      pinned, diffed and served by anything, and this Action needs no service to exist.
+      ⛔ Because the URL names the document, `tenant` is checked AGAINST it rather than used
+      to build it — see the `tenant` input.
+      ⏰ When `config.tbzl.dev` exists it serves a document at a stable URL and this input
+      goes back to having a default; the protocol does not change.
+    required: true
   token-file:
     description: >-
       Path to the file holding the RBE bearer token, written by your token-minting step.
@@ -74,8 +85,11 @@ inputs:
       commits behind the newest immutable release, so "latest" installs the OLDEST binary —
       one that predates both the `FASTVERK_TOKEN_FILE_<HOST>` source this Action depends on
       and the fix for the dead-code-eliminated config feature.
+      ⭐ The default is the newest immutable release and is the FIRST one to publish a
+      `cred-helper-linux-arm64` artifact; lowering it makes the arm64 branch of the install
+      step 404.
     required: false
-    default: "credhelper-a920bfbf49ea"
+    default: "credhelper-782958de5ee6"
   allow-repo-bazelrc:
     description: >-
       Permit the repository's own .bazelrc to declare remote-execution flags alongside the
@@ -143,10 +157,6 @@ runs:
           Darwin/arm64)  asset=tbzl-setup-darwin-arm64 ;;
           *) echo "::error title=setup-tbzl::no tbzl-setup artifact for $(uname -s)/$(uname -m)"; exit 1 ;;
         esac
-        if [ "${SETUP_TAG}" = "setuptbzl-UNRELEASED" ]; then
-          echo "::error title=setup-tbzl::no tbzl-setup release has been published yet, so there is nothing to download. Build it and set TBZL_SETUP_BIN, or pin a published setuptbzl-<sha> in action.yml. setup-tbzl does NOT fall back to defaults."
-          exit 1
-        fi
         dest="${RUNNER_TEMP}/tbzl-setup"
         base="https://github.com/tomato-bazel/setup-tbzl/releases/download/${SETUP_TAG}"
         # ⛔ --fail-with-body, not --fail. A GitHub release 404 answers with a body that says
@@ -161,21 +171,22 @@ runs:
         chmod +x "$dest"
         echo "path=${dest}" >> "$GITHUB_OUTPUT"
       env:
-        # ⏰ NO RELEASE EXISTS YET, AND THIS SAYS SO RATHER THAN 404ing.
+        # ⭐ THE FIRST PUBLISHED RELEASE. `release.yml` publishes immutable `setuptbzl-<sha>`
+        # tags on merge to main; this is the one from fb750d3, verified to carry all three
+        # platform binaries AND `tbzl-setup-sha256.txt` before being pinned here.
         #
-        # `release.yml` publishes immutable `setuptbzl-<sha>` tags on merge to main. Until the
-        # first one exists there is nothing to pin, and a plausible-looking placeholder here
-        # would fail at the download step with a bare HTTP 404 — which reads as a network
-        # problem or a corrupted release, not as "this was never published". The sentinel makes
-        # the resolve step say the true thing.
+        # ⛔ NEVER `setuptbzl-latest`. A rolling tag is written by a publish step that can fail
+        # halfway, and nothing reports that it did: the equivalent tag in
+        # `tomato-bazel/cred-helper` sat NINE commits behind its newest immutable release, so
+        # "latest" there installed the OLDEST binary.
         #
-        # ⚠ AFTER THE FIRST RELEASE: set this to that `setuptbzl-<sha>`. A consumer pins
-        # `setup-tbzl@vN`, which pins this string, which pins the binary by sha256 — one pin,
-        # three layers. Never `setuptbzl-latest`: the equivalent rolling tag in
-        # `tomato-bazel/cred-helper` is NINE commits behind its newest immutable release,
-        # because a partial publish leaves it stale and nothing reports that. "Latest" there
-        # installs the oldest binary.
-        SETUP_TAG: setuptbzl-UNRELEASED
+        # ⚠ CHECK THE ASSET LIST, NOT THE TAG, WHEN BUMPING THIS. A release can exist with only
+        # some of its artifacts — `cslib-oleans` published darwin-only and the tag looked
+        # complete from every angle except the one that mattered.
+        #
+        # A consumer pins `setup-tbzl@vN`, which pins this string, which pins the binary by
+        # sha256 — one pin, three layers.
+        SETUP_TAG: setuptbzl-fb750d3ddb01
 
     # ── 2. the credential helper ─────────────────────────────────────────────────────────
     - name: Install the credential helper
@@ -185,11 +196,13 @@ runs:
         set -euo pipefail
         dest="${RUNNER_TEMP}/cred-helper"
         case "$(uname -s)/$(uname -m)" in
-          Linux/x86_64) asset=cred-helper-linux-amd64 ;;
-          Darwin/arm64) asset=cred-helper-darwin-arm64 ;;
-          # ⛔ tomato-bazel/cred-helper publishes NO linux-arm64 artifact. Fail here, naming
-          # it — an arm64 worker otherwise reaches the probe with no helper and reads as an
-          # auth failure.
+          Linux/x86_64)  asset=cred-helper-linux-amd64 ;;
+          # ⭐ linux-arm64 EXISTS AS OF credhelper-782958de5ee6 and did not before. The pin
+          # below was raised past that release, so this case is reachable; with the previous
+          # pin (credhelper-a920bfbf49ea) it would 404. If you ever lower the pin, this arm
+          # goes back to being a lie.
+          Linux/aarch64) asset=cred-helper-linux-arm64 ;;
+          Darwin/arm64)  asset=cred-helper-darwin-arm64 ;;
           *) echo "::error title=setup-tbzl::cred-helper has no artifact for $(uname -s)/$(uname -m)"; exit 1 ;;
         esac
         curl -sSL --fail-with-body --retry 3 -o "$dest" \
@@ -212,21 +225,22 @@ runs:
       run: |
         set -euo pipefail
         out="${RUNNER_TEMP}/tbzl-build-profile.json"
-        url="${CONFIG_URL%/}/v1/build-profile?tenant=${TENANT}"
-        [ -n "${PLANE}" ]   && url="${url}&plane=${PLANE}"
-        [ -n "${PIN}" ]     && url="${url}&config_version=${PIN}"
-        echo "::notice title=setup-tbzl::fetching ${url}"
-        # ⚠ file:// is supported by curl and is how this is exercised without the service.
+        # ⚠ GitHub does NOT enforce `required: true` on composite-action inputs — an omitted
+        # one arrives as the empty string and `curl ""` fails with a message about a URL
+        # syntax error, which reads as a malformed URL rather than a missing one.
+        [ -n "${CONFIG_URL}" ] || {
+          echo "::error title=setup-tbzl::config-url is required and was empty. It is the URL of the build profile DOCUMENT (a release asset, an S3 object, or a file:// path) — there is no default, because guessing one is exactly the fall-back this Action refuses to do"
+          exit 1
+        }
+        echo "::notice title=setup-tbzl::fetching ${CONFIG_URL}"
+        # ⚠ file:// is supported by curl and is how this is exercised without a service.
         curl -sSL --fail-with-body --retry 3 --retry-connrefused --max-time 20 \
-             -H 'Accept: application/json' -o "$out" "$url" \
-          || { echo "::error title=setup-tbzl::cannot fetch the build profile from ${url}. setup-tbzl does NOT fall back to defaults"; exit 1; }
-        [ -s "$out" ] || { echo "::error title=setup-tbzl::the platform returned an EMPTY build profile"; exit 1; }
+             -H 'Accept: application/json' -o "$out" "${CONFIG_URL}" \
+          || { echo "::error title=setup-tbzl::cannot fetch the build profile from ${CONFIG_URL}. setup-tbzl does NOT fall back to defaults"; exit 1; }
+        [ -s "$out" ] || { echo "::error title=setup-tbzl::the profile at ${CONFIG_URL} is EMPTY. An empty 200 is the failure this checks for: it parses as 'no configuration' rather than as an error"; exit 1; }
         echo "path=${out}" >> "$GITHUB_OUTPUT"
       env:
         CONFIG_URL: ${{ inputs.config-url }}
-        TENANT: ${{ inputs.tenant }}
-        PLANE: ${{ inputs.plane }}
-        PIN: ${{ inputs.config-version }}
 
     # ── 4. verify, then write ────────────────────────────────────────────────────────────
     - name: Configure
@@ -239,17 +253,36 @@ runs:
         [ "${STRICT}"     = "true" ] && flags+=(--strict)
         [ "${SKIP_REACH}" = "true" ] && flags+=(--skip-reachability)
         [ -f "${GITHUB_WORKSPACE}/.bazelrc" ] && flags+=(--repo-bazelrc "${GITHUB_WORKSPACE}/.bazelrc")
+        # ⛔ THE IDENTITY ASSERTIONS, AND THEY ARE THE COST OF NAMING A DOCUMENT BY URL. With a
+        # query string the SERVER resolved tenant→document and a wrong name 404'd. A URL is
+        # resolved by whoever typed it, and the wrong one answers 200 with a valid profile for
+        # somebody else's plane. Only these flags make that fatal.
+        #
+        # ⚠ Empty values are passed through deliberately: the binary treats an empty expectation
+        # as "not asserted", so `plane`/`config-version` stay optional without a second code
+        # path here that could disagree with the binary about what empty means.
+        [ -n "${TENANT}" ] && flags+=(--expect-tenant "${TENANT}")
+        [ -n "${PLANE}" ]  && flags+=(--expect-plane "${PLANE}")
+        [ -n "${PIN}" ]    && flags+=(--expect-config-version "${PIN}")
+        # ⚠ `${flags[@]+"${flags[@]}"}`, NOT `"${flags[@]}"`. Expanding an EMPTY array under
+        # `set -u` is an "unbound variable" error in bash 3.2 — which is what `/bin/bash` is on
+        # a macOS runner, and this Action supports Darwin/arm64. Every flag above is
+        # conditional, so the empty case is reachable, and the failure would appear only on
+        # macOS as an error that names `flags` rather than anything a user configured.
         "${SETUP}" configure \
           --profile "${PROFILE}" \
           --out "${RUNNER_TEMP}/tbzl" \
           --cred-helper "${HELPER}" \
           --token-file "${TOKEN_FILE}" \
-          "${flags[@]}"
+          ${flags[@]+"${flags[@]}"}
       env:
         SETUP: ${{ steps.bin.outputs.path }}
         HELPER: ${{ steps.helper.outputs.path }}
         PROFILE: ${{ steps.profile.outputs.path }}
         TOKEN_FILE: ${{ inputs.token-file }}
+        TENANT: ${{ inputs.tenant }}
+        PLANE: ${{ inputs.plane }}
+        PIN: ${{ inputs.config-version }}
         ALLOW_RC: ${{ inputs.allow-repo-bazelrc }}
         STRICT: ${{ inputs.strict }}
         SKIP_REACH: ${{ inputs.skip-reachability }}
