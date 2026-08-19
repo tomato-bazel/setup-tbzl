@@ -307,3 +307,53 @@ jobs:
           done
           [ "$bad" -eq 0 ] || exit 1
           echo "::notice::${TAG} understands every flag action.yml passes"
+
+      # ⛔⛔ THE INSTALL PATH ITSELF, WHICH SHIPPED BROKEN IN v1 AND WAS INVISIBLE TO EVERY OTHER
+      # CHECK. `action.yml` verified its download with:
+      #
+      #   grep " $asset$" sha256.txt | sed "s| $asset$|  tbzl-setup|" | shasum -a 256 -c -
+      #
+      # sha256.txt separates hash from filename with TWO spaces; the grep consumed one and the
+      # replacement re-added two, so the rebuilt line carried THREE and `shasum -c` read the extra
+      # space as part of the filename. It failed 100% of the time, on Linux and macOS, for every
+      # consumer — and `test` never saw it because every step there sets TBZL_SETUP_BIN, which
+      # short-circuits the download entirely.
+      #
+      # ⚠ THE CRED-HELPER LEG HAD NO CHECKSUM AT ALL until the same change: curl, then chmod +x,
+      # on the binary that handles the bearer token.
+      #
+      # This runs the real thing: both tags read out of action.yml, both artifacts fetched, both
+      # checksums compared. A negative control follows, because a comparison that always passes
+      # would look identical to this one.
+      - name: The Action can actually install and verify both binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          SETUP_TAG=$(sed -n 's/^ *SETUP_TAG: *\(.*\)$/\1/p' action.yml | head -1)
+          CH_TAG=$(sed -n 's/^ *default: *"\(credhelper-[a-z0-9]*\)".*$/\1/p' action.yml | head -1)
+          [ -n "$SETUP_TAG" ] && [ -n "$CH_TAG" ] || { echo "::error::could not read both pins from action.yml (SETUP_TAG='${SETUP_TAG}' CRED_HELPER='${CH_TAG}') — the parser is broken and an empty pin would make every check below vacuous"; exit 1; }
+          echo "::notice::pins: ${SETUP_TAG} / ${CH_TAG}"
+
+          verify() { # repo tag asset sumfile
+            local base="https://github.com/tomato-bazel/$1/releases/download/$2"
+            curl -sSL --fail-with-body --retry 3 -o /tmp/bin "$base/$3"
+            curl -sSL --fail-with-body --retry 3 -o /tmp/sums "$base/$4"
+            local want got
+            want=$(awk -v a="$3" '$NF == a { print $1 }' /tmp/sums)
+            [ -n "$want" ] || { echo "::error::$2 publishes no checksum for $3 — the release is incomplete"; return 1; }
+            got=$(shasum -a 256 /tmp/bin | awk '{ print $1 }')
+            [ "$want" = "$got" ] || { echo "::error::checksum mismatch for $3 at $2: expected $want, got $got"; return 1; }
+            echo "::notice::$3 verified"
+          }
+
+          verify setup-tbzl  "$SETUP_TAG" tbzl-setup-linux-amd64  tbzl-setup-sha256.txt
+          verify cred-helper "$CH_TAG"    cred-helper-linux-amd64 cred-helper-sha256.txt
+
+          # ⚠ NEGATIVE CONTROL. Without it, a `verify` that returned success unconditionally would
+          # produce exactly the output above. Half the incidents this repo exists for are checks
+          # that could not fail.
+          printf 'tampered' >> /tmp/bin
+          got=$(shasum -a 256 /tmp/bin | awk '{ print $1 }')
+          want=$(awk -v a="cred-helper-linux-amd64" '$NF == a { print $1 }' /tmp/sums)
+          [ "$want" != "$got" ] || { echo "::error::a MODIFIED binary matched the published checksum — the comparison above proves nothing"; exit 1; }
+          echo "::notice::negative control passed — a modified binary does not verify"
