@@ -53,8 +53,8 @@ jobs:
   publish:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: bazel-contrib/setup-bazel@0.13.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: bazel-contrib/setup-bazel@663f88d97adf17db2523a5b385d9407a562e5551  # 0.13.0
         with:
           bazelisk-cache: true
           disk-cache: true

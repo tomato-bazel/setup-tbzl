@@ -60,7 +60,7 @@ jobs:
     name: secret-scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           # ⛔ FULL HISTORY. A shallow clone scans only the tip, so a secret added in an
           # earlier commit of the branch and removed in a later one passes — while remaining
@@ -102,8 +102,8 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: bazel-contrib/setup-bazel@0.13.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: bazel-contrib/setup-bazel@663f88d97adf17db2523a5b385d9407a562e5551  # 0.13.0
         with:
           bazelisk-cache: true
           disk-cache: true
@@ -262,7 +262,7 @@ jobs:
     name: the pinned binary understands action.yml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Every flag action.yml passes must be known to the pinned binary
         shell: bash
