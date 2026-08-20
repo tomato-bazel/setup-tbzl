@@ -258,7 +258,7 @@ runs:
         #
         # A consumer pins `setup-tbzl@v1`, which resolves to a commit pinning an immutable
         # release, which pins the binary by sha256 — one pin, three layers.
-        SETUP_TAG: __RELEASE_TAG__
+        SETUP_TAG: setuptbzl-eef76c3633d7
 
     # ── 2. the credential helper ─────────────────────────────────────────────────────────
     - name: Install the credential helper
