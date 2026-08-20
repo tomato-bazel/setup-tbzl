@@ -293,7 +293,10 @@ jobs:
             *) echo "::error::action.yml on a branch must keep SETUP_TAG: __RELEASE_TAG__ (found '${TAG}'). The real tag is written by release.yml into the release commit; a pin on main can only ever name the PREVIOUS release."; exit 1 ;;
           esac
 
-          bazel build //:tbzl-setup --config=ci
+          # ⚠ NO `--config=ci`. That config is defined only as `test:ci` in .bazelrc, so a
+          # `bazel build --config=ci` dies with "Config value 'ci' is not defined in any .rc
+          # file" — which reads as a missing .bazelrc rather than a verb mismatch.
+          bazel build //:tbzl-setup
           dest="${RUNNER_TEMP}/built"
           cp bazel-bin/tbzl-setup "$dest"
           chmod +x "$dest"
@@ -327,7 +330,7 @@ jobs:
             fi
           done
           [ "$bad" -eq 0 ] || exit 1
-          echo "::notice::${TAG} understands every flag action.yml passes"
+          echo "::notice::the binary built from this commit understands every flag action.yml passes"
 
       # ⛔⛔ THE INSTALL PATH ITSELF, WHICH SHIPPED BROKEN IN v1 AND WAS INVISIBLE TO EVERY OTHER
       # CHECK. `action.yml` verified its download with:
