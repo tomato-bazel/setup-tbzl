@@ -193,7 +193,17 @@ jobs:
           if [ "$current" = "$TAG" ]; then
             echo "::notice::action.yml already pins ${TAG}"
           else
-            sed -i "s|SETUP_TAG: ${current}|SETUP_TAG: ${TAG}|" action.yml
+            # ⛔ NO `sed -i`. THIS JOB RUNS ON macos-14, BECAUSE IT BUILDS THE DARWIN BINARY
+            # NATIVELY — and BSD sed's `-i` REQUIRES a backup-extension argument where GNU's
+            # forbids one. The GNU spelling therefore read the script as the extension and the
+            # filename as the script:
+            #
+            #   sed: 1: "action.yml": command a expects \ followed by text
+            #
+            # ⚠ A message that names neither sed's dialect nor the flag, on the one step in this
+            # repository that had never run before. Writing through a temp file has no dialect.
+            tmp=$(mktemp)
+            sed "s|SETUP_TAG: ${current}|SETUP_TAG: ${TAG}|" action.yml > "$tmp" && mv "$tmp" action.yml
             # ⚠ Verify the substitution rather than trusting sed, whose exit code is 0 whether or
             # not it matched anything.
             grep -q "SETUP_TAG: ${TAG}" action.yml || { echo "::error::pin rewrite did not take effect (still ${current})"; exit 1; }
