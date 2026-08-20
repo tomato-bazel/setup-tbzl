@@ -94,6 +94,38 @@ would make a regression un-bisectable, because the knobs would have moved
 underneath the bisect. Changes to the recommendation are deliberate,
 attributable and pinnable (`with: config-version:`).
 
+## How this is released — and why `@v1` is the right pin
+
+```yaml
+- uses: tomato-bazel/setup-tbzl@v1
+```
+
+That is the whole contract. `v1` moves to each release, so you get fixes and new
+flags **without changing anything on your end**. If you want to freeze an exact
+version, pin `v1.Y.Z` — those are immutable and never rewritten.
+
+⭐ **`main` is source; releases are tags.** `action.yml` on `main` carries
+`SETUP_TAG: __RELEASE_TAG__`, not a real pin. On merge, `release.yml` publishes
+an immutable `setuptbzl-<sha>` release, substitutes that tag into `action.yml`,
+and commits **on a ref only the release tags point at**. So every published `v1`
+resolves to an `action.yml` pinning its *own* release.
+
+⛔ That is a state no human can produce by hand, and the reason for the whole
+arrangement: the release for a commit does not exist until that commit is
+merged, so any pin written on a branch can only ever name the *previous*
+release. This repository burned three red guards on exactly that, and shipped a
+`main` whose `action.yml` passed `--expect-tenant` to a binary published before
+that flag existed.
+
+⚠ **`@main` will not install, deliberately.** It fails with a message telling you
+to use `@v1`, rather than 404-ing on a literal placeholder — which reads as a
+network fault.
+
+⚠ The earlier mechanism pushed the pin commit to `main` and could not work:
+`main` is a protected branch, so every release failed with
+`GH006: Protected branch update failed` and `v1` silently sat four merges
+behind. Tags are not branch-protected, and a release *is* a tag.
+
 ### 3. Public repo, real secret gate
 
 This repository is public because `savvifi/aion` is a **different org** and a

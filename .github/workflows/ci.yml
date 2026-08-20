@@ -258,28 +258,52 @@ jobs:
   # happens before anything else, so a bogus `--profile` still proves the flag is understood — and
   # that keeps this job free of fixtures, tokens and a credential helper, which is what stops it
   # rotting into another happy-path test.
+  # ⚠ THIS JOB CHECKS THE BINARY BUILT FROM THIS COMMIT, NOT A PUBLISHED PIN — and the change
+  # is the point. action.yml on main carries `SETUP_TAG: __RELEASE_TAG__`; the real tag is
+  # substituted by release.yml into a commit only the release tags point at (main is protected,
+  # and a release mechanism that rewrites the default branch is a standing exception, not a
+  # mechanism). So there is no pin here to download.
+  #
+  # ⭐ That also DISSOLVES the failure this job was written for. The old bug — action.yml passing
+  # a flag the pinned binary predates — is now structurally impossible, because the pin and the
+  # action.yml that names it are produced from the SAME commit at release time. What remains
+  # worth checking on a PR is the honest invariant: does the binary this source builds
+  # understand every flag this action.yml passes?
   pinned-binary-understands-the-action:
-    name: the pinned binary understands action.yml
+    name: the built binary understands action.yml
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: bazel-contrib/setup-bazel@663f88d97adf17db2523a5b385d9407a562e5551  # 0.13.0
+        with:
+          bazelisk-cache: true
+          disk-cache: true
 
-      - name: Every flag action.yml passes must be known to the pinned binary
+      - name: Every flag action.yml passes must be known to the binary this commit builds
         shell: bash
         run: |
           set -euo pipefail
+          # ⛔ ASSERT THE PLACEHOLDER IS STILL A PLACEHOLDER. If someone reinstates a real tag on
+          # main, the release job's substitution silently stops matching and every published v1
+          # would ship the stale pin — the exact bug this design removes, returning invisibly.
           TAG=$(sed -n 's/^ *SETUP_TAG: *\(.*\)$/\1/p' action.yml | head -1)
           [ -n "$TAG" ] || { echo "::error::could not read SETUP_TAG from action.yml"; exit 1; }
-          echo "::notice::action.yml pins ${TAG}"
+          case "$TAG" in
+            __RELEASE_TAG__) : ;;
+            *) echo "::error::action.yml on a branch must keep SETUP_TAG: __RELEASE_TAG__ (found '${TAG}'). The real tag is written by release.yml into the release commit; a pin on main can only ever name the PREVIOUS release."; exit 1 ;;
+          esac
 
-          dest="${RUNNER_TEMP}/pinned"
-          curl -sSL --fail-with-body --retry 3 -o "$dest" \
-            "https://github.com/tomato-bazel/setup-tbzl/releases/download/${TAG}/tbzl-setup-linux-amd64"
+          # ⚠ NO `--config=ci`. That config is defined only as `test:ci` in .bazelrc, so a
+          # `bazel build --config=ci` dies with "Config value 'ci' is not defined in any .rc
+          # file" — which reads as a missing .bazelrc rather than a verb mismatch.
+          bazel build //:tbzl-setup
+          dest="${RUNNER_TEMP}/built"
+          cp bazel-bin/tbzl-setup "$dest"
           chmod +x "$dest"
 
           # The flags the Action actually passes: the fixed ones on the `configure` line, plus
           # every conditional `flags+=(--x)`. Derived from action.yml so a flag added there
-          # without bumping the pin fails HERE rather than at a consumer.
+          # without the corresponding src/ change fails HERE rather than at a consumer.
           mapfile -t FLAGS < <(
             { grep -oE 'flags\+=\(--[a-z-]+' action.yml | sed 's/flags+=(//'
               grep -oE '^ +--[a-z-]+ "\$\{' action.yml | grep -oE '\--[a-z-]+'
@@ -297,16 +321,16 @@ jobs:
             # NIT. Three of these flags are BOOLEAN (`--strict`, `--skip-reachability`,
             # `--allow-repo-bazelrc`), so the `x` this probe appends is itself unknown and the
             # binary answers `unknown flag "x"`. A bare grep therefore reports those three as
-            # broken against a PERFECTLY CORRECT pin — a check that is red no matter what, which
-            # gets muted and then catches nothing. Verified against both binaries: matching by
-            # name reports 5 stale flags for the old pin and zero for the new one.
+            # broken against a PERFECTLY CORRECT binary — a check that is red no matter what,
+            # which gets muted and then catches nothing. Verified against both binaries: matching
+            # by name reported 5 stale flags for the old pin and zero for the new one.
             if grep -qF "unknown flag \"$f\"" <<<"$out"; then
-              echo "::error::the pinned binary (${TAG}) does not understand ${f}, which action.yml passes. Bump SETUP_TAG to a release that contains it."
+              echo "::error::the binary built from this commit does not understand ${f}, which action.yml passes. Either src/ is missing the flag or action.yml should not be passing it."
               bad=1
             fi
           done
           [ "$bad" -eq 0 ] || exit 1
-          echo "::notice::${TAG} understands every flag action.yml passes"
+          echo "::notice::the binary built from this commit understands every flag action.yml passes"
 
       # ⛔⛔ THE INSTALL PATH ITSELF, WHICH SHIPPED BROKEN IN v1 AND WAS INVISIBLE TO EVERY OTHER
       # CHECK. `action.yml` verified its download with:
@@ -322,17 +346,31 @@ jobs:
       # ⚠ THE CRED-HELPER LEG HAD NO CHECKSUM AT ALL until the same change: curl, then chmod +x,
       # on the binary that handles the bearer token.
       #
-      # This runs the real thing: both tags read out of action.yml, both artifacts fetched, both
-      # checksums compared. A negative control follows, because a comparison that always passes
-      # would look identical to this one.
+      # This runs the real thing: both artifacts fetched, both checksums compared. A negative
+      # control follows, because a comparison that always passes would look identical to this one.
+      #
+      # ⚠ THE SETUP TAG IS RESOLVED, NOT READ FROM action.yml. On a branch it is the
+      # `__RELEASE_TAG__` placeholder — release.yml substitutes the real tag into the release
+      # commit. So this check exercises the install path against the NEWEST PUBLISHED immutable
+      # release, which is what the next `v1` will pin.
+      #
+      # ⛔ `setuptbzl-latest` is excluded deliberately. It is a rolling tag written by a publish
+      # step that can fail halfway with nothing reporting it — the equivalent tag in
+      # `tomato-bazel/cred-helper` sat NINE commits behind its newest immutable release.
       - name: The Action can actually install and verify both binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          SETUP_TAG=$(sed -n 's/^ *SETUP_TAG: *\(.*\)$/\1/p' action.yml | head -1)
+          SETUP_TAG=$(gh release list --repo tomato-bazel/setup-tbzl --limit 100 \
+                        --json tagName --jq '.[].tagName' \
+                      | grep -E '^setuptbzl-[0-9a-f]{12}$' | head -1)
           CH_TAG=$(sed -n 's/^ *default: *"\(credhelper-[a-z0-9]*\)".*$/\1/p' action.yml | head -1)
-          [ -n "$SETUP_TAG" ] && [ -n "$CH_TAG" ] || { echo "::error::could not read both pins from action.yml (SETUP_TAG='${SETUP_TAG}' CRED_HELPER='${CH_TAG}') — the parser is broken and an empty pin would make every check below vacuous"; exit 1; }
-          echo "::notice::pins: ${SETUP_TAG} / ${CH_TAG}"
+          # ⛔ An empty tag would make every check below vacuous — and an empty result is exactly
+          # what a broken `gh` call or a changed tag format returns. Assert, do not assume.
+          [ -n "$SETUP_TAG" ] && [ -n "$CH_TAG" ] || { echo "::error::could not resolve both tags (SETUP_TAG='${SETUP_TAG}' from published releases, CRED_HELPER='${CH_TAG}' from action.yml) — an empty tag would make every check below pass while testing nothing"; exit 1; }
+          echo "::notice::verifying against: ${SETUP_TAG} / ${CH_TAG}"
 
           verify() { # repo tag asset sumfile
             local base="https://github.com/tomato-bazel/$1/releases/download/$2"
