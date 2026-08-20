@@ -159,8 +159,20 @@ jobs:
           fi
           echo "Asset base: https://github.com/tomato-bazel/setup-tbzl/releases/download/${TAG}/"
 
-      # ⭐⭐ THE RELEASE PINS ITSELF, AND THEN MOVES v1. This closes the loop behind every pin
-      # problem this repository has had today.
+      # ⭐⭐ THE RELEASE PINS ITSELF, AND THEN MOVES v1 — WITHOUT EVER WRITING TO main.
+      #
+      # ⛔ THE EARLIER VERSION PUSHED THE PIN COMMIT TO main AND COULD NOT WORK: main is a
+      # protected branch, deliberately, so every release failed with
+      #
+      #   GH006: Protected branch update failed for refs/heads/main
+      #
+      # and v1 silently stayed four merges behind. A release mechanism that requires rewriting
+      # the protected default branch on every merge is not a mechanism, it is a standing
+      # exception. Tags are not branch-protected, and a release IS a tag.
+      #
+      # So the pin commit is created and never pushed to any branch — only the release tags
+      # point at it. That is the same shape as an action that commits its built `dist/` on a
+      # release ref: main holds source, the tag holds what consumers execute.
       #
       # ⛔ A HAND-WRITTEN PIN CAN NEVER BE CORRECT. action.yml names the release its binary comes
       # from, but the release for a commit does not exist until that commit is merged — so a PR
@@ -180,7 +192,7 @@ jobs:
       #
       # ⚠ IT CANNOT LOOP. A push made with GITHUB_TOKEN does not create a workflow run, so the
       # pin commit does not re-trigger release.yml.
-      - name: Pin action.yml at this release and move v1
+      - name: Pin action.yml at this release, then publish vN and move v1
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -207,18 +219,57 @@ jobs:
             # ⚠ Verify the substitution rather than trusting sed, whose exit code is 0 whether or
             # not it matched anything.
             grep -q "SETUP_TAG: ${TAG}" action.yml || { echo "::error::pin rewrite did not take effect (still ${current})"; exit 1; }
+            # ⚠ COMMITTED, NEVER PUSHED TO A BRANCH. Only the release tags below point at this
+            # commit. main is protected and stays source-only.
             git -c user.name='setup-tbzl-ci' -c user.email='ci@tomato-bazel.invalid' \
               commit -q -a -m "release: pin action.yml at ${TAG}" \
-              -m "Written by release.yml after publishing ${TAG}. A hand-written pin can only ever name the PREVIOUS release, because the release for a commit does not exist until that commit is merged."
-            git push origin HEAD:main
+              -m "Written by release.yml after publishing ${TAG}. A hand-written pin can only ever name the PREVIOUS release, because the release for a commit does not exist until that commit is merged. This commit is reachable only from the release tags."
             echo "::notice::pinned action.yml at ${TAG}"
           fi
 
-          # ⛔ v1 MOVES TO THE PINNED COMMIT, NOT TO $GITHUB_SHA. Those differ whenever the step
-          # above committed, and the pinned commit is the only one whose action.yml names this
-          # release. Moving v1 to $GITHUB_SHA would republish the stale pin under the tag
+          # ⛔ THE TAGS POINT AT THE PINNED COMMIT, NOT AT $GITHUB_SHA. Those differ whenever the
+          # step above committed, and the pinned commit is the only one whose action.yml names
+          # this release. Tagging $GITHUB_SHA would republish the placeholder under the tag
           # consumers actually use — which is the bug this whole step exists to end.
           target=$(git rev-parse HEAD)
+
+          # ⛔ SELF-CONSISTENCY IS ASSERTED BEFORE ANY TAG MOVES. If the freshly published binary
+          # does not understand a flag this action.yml passes, publishing v1 would break every
+          # consumer at once. Better to leave v1 where it is and fail here.
+          probe="${RUNNER_TEMP}/probe"
+          curl -sSL --fail-with-body --retry 3 -o "$probe" \
+            "https://github.com/tomato-bazel/setup-tbzl/releases/download/${TAG}/tbzl-setup-linux-amd64"
+          # ⚠ Cannot exec a linux binary on macos-14, so this asserts the ASSET EXISTS and is the
+          # right architecture. The flag-level check runs in ci.yml against a native build.
+          file "$probe" | grep -q 'ELF 64-bit.*x86-64' \
+            || { echo "::error::${TAG} does not publish a usable linux-amd64 asset — refusing to move v1"; exit 1; }
+
+          # ── the version tags ──
+          # ⭐ TWO TAGS, TWO JOBS. `v1` floats so consumers get patches with no change on their
+          # end; `v1.Y.Z` is immutable so anyone who wants an exact pin has one. This is the
+          # ordinary GitHub Action convention, and it is why consumers never touch a sha.
+          git fetch -q --tags origin
+          last=$(git tag -l 'v1.*.*' | sort -V | tail -1)
+          if [ -z "$last" ]; then
+            next="v1.0.0"
+          else
+            IFS=. read -r maj min patch <<<"${last#v}"
+            next="v${maj}.${min}.$((patch + 1))"
+          fi
+          # ⚠ An immutable tag is never rewritten. If it somehow exists, stop rather than -f it.
+          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            echo "::error::${next} already exists — refusing to rewrite an immutable version tag"; exit 1
+          fi
+
+          git tag -a "$next" "$target" -m "setup-tbzl ${next} (pins ${TAG})"
+          git push origin "refs/tags/${next}"
           git tag -f v1 "$target"
           git push -f origin refs/tags/v1
-          echo "::notice::v1 -> ${target:0:12} (pins ${TAG})"
+          echo "::notice::${next} and v1 -> ${target:0:12} (pins ${TAG})"
+
+          # ⭐ A real release for the version tag, so `v1.Y.Z` shows up as a version rather than
+          # only as a git ref. Assets live on the immutable setuptbzl-<sha> release; this one is
+          # the human-facing entry point.
+          gh release create "$next" \
+            --title "setup-tbzl ${next}" \
+            --notes "Pins \`${TAG}\`. Consumers should use \`tomato-bazel/setup-tbzl@v1\` — it moves to each release, so patches need no change on your end. Pin \`${next}\` to freeze an exact version."

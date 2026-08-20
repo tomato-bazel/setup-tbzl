@@ -181,6 +181,22 @@ runs:
           echo "path=${TBZL_SETUP_BIN}" >> "$GITHUB_OUTPUT"
           exit 0
         fi
+        # ⛔ main CARRIES A PLACEHOLDER, NOT A PIN, AND THAT IS DELIBERATE.
+        #
+        # The release for a commit does not exist until that commit is merged, so a pin written
+        # by hand — or on a branch — can only ever name the PREVIOUS release. This repository
+        # burned three red guards on exactly that. `release.yml` now writes the real tag into a
+        # commit that only the release TAGS point at, so `v1` always resolves to an action.yml
+        # pinning its OWN release, and main stays source.
+        #
+        # ⚠ Which means `@main` cannot install. Fail here with a sentence naming what to use,
+        # rather than letting curl 404 on a literal placeholder — which reads as a network fault.
+        case "${SETUP_TAG}" in
+          __RELEASE*)
+            echo "::error title=setup-tbzl::setup-tbzl was used from a branch, which carries no release pin — main is source, releases are tags. Use: tomato-bazel/setup-tbzl@v1"
+            exit 1
+            ;;
+        esac
         case "$(uname -s)/$(uname -m)" in
           Linux/x86_64)  asset=tbzl-setup-linux-amd64 ;;
           Linux/aarch64) asset=tbzl-setup-linux-arm64 ;;
@@ -224,22 +240,25 @@ runs:
         chmod +x "$dest"
         echo "path=${dest}" >> "$GITHUB_OUTPUT"
       env:
-        # ⭐ THE FIRST PUBLISHED RELEASE. `release.yml` publishes immutable `setuptbzl-<sha>`
-        # tags on merge to main; this is the one from fb750d3, verified to carry all three
-        # platform binaries AND `tbzl-setup-sha256.txt` before being pinned here.
+        # ⭐ A PLACEHOLDER ON main; THE REAL TAG IS WRITTEN AT RELEASE TIME.
         #
-        # ⛔ NEVER `setuptbzl-latest`. A rolling tag is written by a publish step that can fail
-        # halfway, and nothing reports that it did: the equivalent tag in
+        # `release.yml` publishes an immutable `setuptbzl-<sha>` release, then substitutes that
+        # tag here in a commit that ONLY the release tags point at. So every published `vN`
+        # resolves to an action.yml pinning its OWN release — a state no human can produce by
+        # hand, because the release does not exist until the commit is merged.
+        #
+        # ⛔ DO NOT REPLACE THIS WITH A REAL TAG ON main. That is what made three guards red:
+        # a branch opened before a bump carries a pin predating a flag its own action.yml
+        # passes. main is source; releases are tags.
+        #
+        # ⛔ NEVER `setuptbzl-latest` either. A rolling tag is written by a publish step that can
+        # fail halfway and nothing reports that it did: the equivalent tag in
         # `tomato-bazel/cred-helper` sat NINE commits behind its newest immutable release, so
         # "latest" there installed the OLDEST binary.
         #
-        # ⚠ CHECK THE ASSET LIST, NOT THE TAG, WHEN BUMPING THIS. A release can exist with only
-        # some of its artifacts — `cslib-oleans` published darwin-only and the tag looked
-        # complete from every angle except the one that mattered.
-        #
-        # A consumer pins `setup-tbzl@vN`, which pins this string, which pins the binary by
-        # sha256 — one pin, three layers.
-        SETUP_TAG: setuptbzl-065ba68faa05
+        # A consumer pins `setup-tbzl@v1`, which resolves to a commit pinning an immutable
+        # release, which pins the binary by sha256 — one pin, three layers.
+        SETUP_TAG: __RELEASE_TAG__
 
     # ── 2. the credential helper ─────────────────────────────────────────────────────────
     - name: Install the credential helper
