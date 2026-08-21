@@ -29,6 +29,15 @@ on:
   push:
     branches: [main]
     paths:
+      # ⛔⛔ `action.yml` IS IN THIS LIST BECAUSE ITS ABSENCE WOULD HAVE STRANDED THE FIX FOR
+      # AN UNLOADABLE MANIFEST. It is the one file every consumer actually executes, and it
+      # was the only one not listed here — so a change to it alone cut NO release, moved
+      # `v1` nowhere, and left every consumer on the broken tag while `main` read as fixed.
+      #
+      # ⚠ That is precisely the bug this commit repairs: v1.0.0's `action.yml` was unloadable,
+      # and an action.yml-only fix would not have shipped. This PR only triggered a release
+      # because it happens to add a file under `tests/` — luck, not design.
+      - 'action.yml'
       - 'src/**'
       - 'tests/**'
       - 'Cargo.toml'

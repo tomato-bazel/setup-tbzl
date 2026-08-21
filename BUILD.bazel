@@ -105,3 +105,15 @@ exports_files([
     "action.yml",
     ".gitleaks.toml",
 ])
+
+# ⛔ THE MANIFEST IS ONLY VALIDATED WHEN A WORKFLOW *USES* THIS ACTION. Everything else in this
+# repo — bazel, actionlint, review — reads action.yml as ordinary YAML, where an expression in a
+# `description:` is just a string. v1.0.0 shipped unloadable for exactly that reason and failed
+# on first contact with its first consumer.
+rust_test(
+    name = "action_manifest_test",
+    srcs = ["tests/action_manifest.rs"],
+    data = ["action.yml"],
+    edition = "2021",
+    env = {"TBZL_SETUP_SRCDIR": "."},
+)

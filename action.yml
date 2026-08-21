@@ -142,9 +142,29 @@ inputs:
 
 outputs:
   bazelrc:
-    description: >-
-      Path to the generated bazelrc. ⚠ `--bazelrc` is a STARTUP flag:
-      `bazel --bazelrc=${{ steps.x.outputs.bazelrc }} build //...`, never after the command.
+    # ⛔⛔ NO `${{ … }}` IN A description, EVER — GITHUB PARSES THESE STRINGS AS EXPRESSIONS.
+    # This description used to carry a usage example reading
+    # `bazel --bazelrc=$\{{ steps.x.outputs.bazelrc }} build //...`, and it made the Action
+    # UNLOADABLE for every consumer:
+    #
+    #   action.yml (Line: 145, Col: 18): Unrecognized named-value: 'steps'.
+    #   Located at position 1 within expression: steps.x.outputs.bazelrc
+    #   ##[error]Failed to load tomato-bazel/setup-tbzl/v1/action.yml
+    #
+    # ⚠ `steps` IS valid in `value:` below — it is a composite action — and is NOT valid in a
+    # `description`, which GitHub still evaluates. The two lines look alike and only one is
+    # legal, which is what made this hard to see by reading.
+    #
+    # ⛔ AND NOTHING IN THIS REPOSITORY COULD CATCH IT. The manifest is only parsed when a
+    # workflow USES the action; `bazel test`, `actionlint` and this repo's own CI all load it
+    # as a plain YAML file, where the string is just a string. It failed on first contact with
+    # its first consumer (fastverk/fastverk#43) and had been released as v1 for a day.
+    #
+    # ⚠ `--bazelrc` is a STARTUP flag: it must precede the command, never follow it. After
+    # `test` it parses as a build option and is silently ignored — the build then runs with no
+    # remote configuration at all, slower and green. The example lives in README.md, where an
+    # expression is inert.
+    description: "Path to the generated bazelrc. Pass it as a STARTUP flag, before the command."
     value: ${{ steps.configure.outputs.bazelrc }}
   config-version:
     description: "The recommendation version this build resolved. Record it in the build record."
