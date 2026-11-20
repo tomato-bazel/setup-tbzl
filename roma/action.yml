@@ -13,6 +13,12 @@ inputs:
   release-token:
     description: Token with contents read access to tomato-bazel/roma
     required: true
+  build-args:
+    description: Arguments to roma build, one per line
+    default: //...
+  test-args:
+    description: Arguments to roma test, one per line
+    default: //...
 outputs:
   executable:
     description: Absolute path to the verified Roma executable
@@ -77,6 +83,21 @@ runs:
       shell: bash
       env:
         ROMA: ${{ steps.install.outputs.executable }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+        TEST_ARGS: ${{ inputs.test-args }}
       run: |
-        "$ROMA" build //...
-        "$ROMA" test //...
+        set -euo pipefail
+        build_args=()
+        test_args=()
+        while IFS= read -r arg; do
+          [[ -z "$arg" ]] || build_args+=("$arg")
+        done <<< "$BUILD_ARGS"
+        while IFS= read -r arg; do
+          [[ -z "$arg" ]] || test_args+=("$arg")
+        done <<< "$TEST_ARGS"
+        if (( ${#build_args[@]} == 0 || ${#test_args[@]} == 0 )); then
+          echo "::error::Both Roma build and test require arguments."
+          exit 1
+        fi
+        "$ROMA" build "${build_args[@]}"
+        "$ROMA" test "${test_args[@]}"
