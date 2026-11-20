@@ -11,10 +11,11 @@ Use a trusted job with checkout, Bash, GitHub CLI, `shasum`, and `tar`. Select t
 | `sha256` | Independently pinned SHA-256 of the platform archive |
 | `release-token` | Caller-supplied token with Contents read access to the private Roma repository |
 | `resolve-native-modules` | Set to `'true'` to resolve pinned Bzlmod sources and built-in modules with Roma. Defaults to `'false'`. |
+| `registries` | Optional registry URLs in resolution priority order, one per line. The default uses the Bazel Central Registry. |
 | `build-args` | Optional build arguments, one per line. Defaults to `//...`. |
 | `test-args` | Optional test arguments, one per line. Defaults to `//...`. |
 
-With native module resolution enabled, the action runs `roma modules --resolve --include-builtin` in the checked-out workspace, stores its sources in a job-local temporary directory, and passes that directory to both commands through `--fetched`. The `module-sources` output exposes the same directory for follow-on commands in the job. Configure required SDKs and repository authentication before calling the action. For example, install a Java runtime before enabling this input for rules_tla. For a separate clean comparison, resolve modules again from the comparison workspace.
+With native module resolution enabled, the action runs `roma modules --resolve --include-builtin` in the checked-out workspace, stores its sources in a job-local temporary directory, and passes that directory to both commands through `--fetched`. The `module-sources` output exposes the same directory for follow-on commands in the job. Configure required SDKs and repository authentication before calling the action. For example, install a Java runtime before enabling this input for rules_tla. For a separate clean comparison, resolve modules again from the comparison workspace. Set `registries` in the same order as the repository's Bazel configuration. For example, Truss uses `https://registry.tbzl.dev/` followed by `https://bcr.bazel.build/`.
 
 The token is used for the archive download. The workflow must supply any credentials the build needs for private dependencies or remote execution separately. Use `contents: read` for checkout and grant any additional workflow permissions only where required. Never run the private download job for a fork pull request or under `pull_request_target`. The action also rejects these events.
 
@@ -39,7 +40,7 @@ jobs:
           owner: tomato-bazel
           repositories: roma
           permission-contents: read
-      - uses: tomato-bazel/setup-tbzl/roma@5655a95c276f86658edba27108f73fd3199e1b6e
+      - uses: tomato-bazel/setup-tbzl/roma@c8769b970feffe884dc20507cdf8dd9dc8d20a8d
         with:
           version: ${{ vars.ROMA_VERSION }}
           source: ${{ vars.ROMA_SOURCE }}
