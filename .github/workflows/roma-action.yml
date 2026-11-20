@@ -25,6 +25,12 @@ jobs:
           set -eu
           [[ -z "${GH_TOKEN:-}" ]]
           printf '%s\n' "$*" >> "$RUNNER_TEMP/roma-fixture/commands"
+          if [[ "$1" == modules ]]; then
+            [[ "$#" == 9 && "$2" == --resolve && "$3" == --include-builtin && "$4" == --out &&
+              "$6" == --registry && "$7" == https://registry.tbzl.dev/ &&
+              "$8" == --registry && "$9" == https://bcr.bazel.build/ ]]
+            mkdir "$5/external"
+          fi
           if [[ "$1" == test && "$2" == //:fail ]]; then exit 9; fi
           SCRIPT
           chmod +x "$fixture/roma"
@@ -63,11 +69,29 @@ jobs:
           sha256: ${{ steps.fixture.outputs.sha256 }}
           release-token: fixture-token
           test-args: //:fail
+      - name: Resolve ordered registries with the action
+        id: native
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./roma
+        with:
+          version: v1.2.3
+          source: ${{ steps.fixture.outputs.source }}
+          sha256: ${{ steps.fixture.outputs.sha256 }}
+          release-token: fixture-token
+          resolve-native-modules: 'true'
+          registries: |
+            https://registry.tbzl.dev/
+            https://bcr.bazel.build/
       - name: Require the expected commands and failure
         if: github.event.pull_request.head.repo.full_name == github.repository
         env:
           OUTCOME: ${{ steps.negative.outcome }}
+          SOURCES: ${{ steps.native.outputs.module-sources }}
         run: |
           test "$OUTCOME" = failure
-          printf 'build //:build\ntest //:test\nbuild //...\ntest //:fail\n' |
-            diff - "$RUNNER_TEMP/roma-fixture/commands"
+          test -d "$SOURCES"
+          {
+            printf 'build //:build\ntest //:test\nbuild //...\ntest //:fail\n'
+            printf 'modules --resolve --include-builtin --out %s --registry https://registry.tbzl.dev/ --registry https://bcr.bazel.build/\n' "${SOURCES%/external}"
+            printf 'build --fetched %s //...\ntest --fetched %s //...\n' "$SOURCES" "$SOURCES"
+          } | diff - "$RUNNER_TEMP/roma-fixture/commands"
