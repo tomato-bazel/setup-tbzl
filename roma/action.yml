@@ -13,6 +13,9 @@ inputs:
   release-token:
     description: Token with contents read access to tomato-bazel/roma
     required: true
+  resolve-native-modules:
+    description: Resolve pinned Bzlmod sources and built-in modules before building
+    default: 'false'
   build-args:
     description: Arguments to roma build, one per line
     default: //...
@@ -20,6 +23,9 @@ inputs:
     description: Arguments to roma test, one per line
     default: //...
 outputs:
+  module-sources:
+    description: Directory of fetched modules when native resolution is enabled
+    value: ${{ steps.modules.outputs.sources }}
   executable:
     description: Absolute path to the verified Roma executable
     value: ${{ steps.install.outputs.executable }}
@@ -79,10 +85,22 @@ runs:
         grep -Fxq "platform=$platform" "$dir/BUILD-INFO"
         test -x "$dir/roma"
         printf 'executable=%s\n' "$dir/roma" >> "$GITHUB_OUTPUT"
+    - name: Resolve native module sources
+      id: modules
+      if: inputs.resolve-native-modules == 'true'
+      shell: bash
+      env:
+        ROMA: ${{ steps.install.outputs.executable }}
+      run: |
+        set -euo pipefail
+        state=$(mktemp -d "$RUNNER_TEMP/roma-modules.XXXXXX")
+        "$ROMA" modules --resolve --include-builtin --out "$state"
+        printf 'sources=%s\n' "$state/external" >> "$GITHUB_OUTPUT"
     - name: Build and test the checkout
       shell: bash
       env:
         ROMA: ${{ steps.install.outputs.executable }}
+        MODULE_SOURCES: ${{ steps.modules.outputs.sources }}
         BUILD_ARGS: ${{ inputs.build-args }}
         TEST_ARGS: ${{ inputs.test-args }}
       run: |
@@ -98,6 +116,10 @@ runs:
         if (( ${#build_args[@]} == 0 || ${#test_args[@]} == 0 )); then
           echo "::error::Both Roma build and test require arguments."
           exit 1
+        fi
+        if [[ -n "$MODULE_SOURCES" ]]; then
+          build_args=(--fetched "$MODULE_SOURCES" "${build_args[@]}")
+          test_args=(--fetched "$MODULE_SOURCES" "${test_args[@]}")
         fi
         "$ROMA" build "${build_args[@]}"
         "$ROMA" test "${test_args[@]}"
