@@ -15,7 +15,7 @@ Use a trusted job with checkout, Bash, GitHub CLI, `shasum`, and `tar`. Select t
 
 The token is used for the archive download. The workflow must supply any credentials the build needs for private dependencies or remote execution separately. Use `contents: read` for checkout and grant any additional workflow permissions only where required. Never run the private download job for a fork pull request or under `pull_request_target`. The action also rejects these events.
 
-During qualification, use the reviewed action commit in the following example. Replace the example secret reference with the name approved for your organization and repositories.
+During qualification, pin the reviewed action commit. Tomato Bazel assigns `FASTVERK_APP_ID` and `FASTVERK_APP_PRIVATE_KEY` to authorized repositories. The `rules_tla` credential probe confirmed that this App can mint a token limited to reading Roma releases.
 
 ```yaml
 permissions:
@@ -28,12 +28,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/create-github-app-token@v2
+        id: roma_read
+        with:
+          app-id: ${{ secrets.FASTVERK_APP_ID }}
+          private-key: ${{ secrets.FASTVERK_APP_PRIVATE_KEY }}
+          owner: tomato-bazel
+          repositories: roma
+          permission-contents: read
       - uses: tomato-bazel/setup-tbzl/roma@15dbe9fffdac5a8a677e30444ef6671fc5406e84
         with:
           version: ${{ vars.ROMA_VERSION }}
           source: ${{ vars.ROMA_SOURCE }}
           sha256: ${{ vars.ROMA_LINUX_AMD64_SHA256 }}
-          release-token: ${{ secrets.ROMA_RELEASE_READ_TOKEN }}
+          release-token: ${{ steps.roma_read.outputs.token }}
 ```
 
 The example describes the draft interface. Use an archive for the selected runner only after it has been published and qualified on that platform.
