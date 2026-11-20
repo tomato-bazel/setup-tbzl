@@ -16,6 +16,9 @@ inputs:
   resolve-native-modules:
     description: Resolve pinned Bzlmod sources and built-in modules before building
     default: 'false'
+  registries:
+    description: Optional registry URLs in resolution priority order, one per line
+    default: ''
   build-args:
     description: Arguments to roma build, one per line
     default: //...
@@ -91,10 +94,15 @@ runs:
       shell: bash
       env:
         ROMA: ${{ steps.install.outputs.executable }}
+        REGISTRIES: ${{ inputs.registries }}
       run: |
         set -euo pipefail
         state=$(mktemp -d "$RUNNER_TEMP/roma-modules.XXXXXX")
-        "$ROMA" modules --resolve --include-builtin --out "$state"
+        registry_args=()
+        while IFS= read -r registry; do
+          [[ -z "$registry" ]] || registry_args+=(--registry "$registry")
+        done <<< "$REGISTRIES"
+        "$ROMA" modules --resolve --include-builtin --out "$state" "${registry_args[@]}"
         printf 'sources=%s\n' "$state/external" >> "$GITHUB_OUTPUT"
     - name: Build and test the checkout
       shell: bash
