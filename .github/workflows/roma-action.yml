@@ -1,0 +1,97 @@
+name: Roma action fixture
+on:
+  pull_request:
+    paths:
+      - roma/**
+      - .github/workflows/roma-action.yml
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Create an archive and mock release download
+        id: fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/roma-fixture"
+          mkdir -p "$fixture/mock"
+          cat > "$fixture/roma" <<'SCRIPT'
+          #!/bin/bash
+          set -eu
+          [[ -z "${GH_TOKEN:-}" ]]
+          printf '%s\n' "$*" >> "$RUNNER_TEMP/roma-fixture/commands"
+          if [[ "$1" == modules ]]; then
+            [[ "$#" == 9 && "$2" == --resolve && "$3" == --include-builtin && "$4" == --out &&
+              "$6" == --registry && "$7" == https://registry.tbzl.dev/ &&
+              "$8" == --registry && "$9" == https://bcr.bazel.build/ ]]
+            mkdir "$5/external"
+          fi
+          if [[ "$1" == test && "$2" == //:fail ]]; then exit 9; fi
+          SCRIPT
+          chmod +x "$fixture/roma"
+          printf 'version=v1.2.3\nsource=%040d\nplatform=linux-amd64\n' 1 > "$fixture/BUILD-INFO"
+          archive=roma-v1.2.3-linux-amd64.tar.gz
+          tar -czf "$fixture/$archive" -C "$fixture" roma BUILD-INFO
+          sum=$(sha256sum "$fixture/$archive")
+          printf 'sha256=%s\nsource=%040d\n' "${sum%% *}" 1 >> "$GITHUB_OUTPUT"
+          cat > "$fixture/mock/gh" <<'SCRIPT'
+          #!/bin/bash
+          set -eu
+          [[ "$1 $2 $3 $4 $5 $6 $7 $8" == 'release download v1.2.3 --repo tomato-bazel/roma --pattern roma-v1.2.3-linux-amd64.tar.gz --dir' ]]
+          [[ "$GH_TOKEN" == fixture-token ]]
+          cp "$RUNNER_TEMP/roma-fixture/$7" "$9/"
+          SCRIPT
+          chmod +x "$fixture/mock/gh"
+          printf '%s\n' "$fixture/mock" >> "$GITHUB_PATH"
+      - name: Install, build, and test using the action
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./roma
+        with:
+          version: v1.2.3
+          source: ${{ steps.fixture.outputs.source }}
+          sha256: ${{ steps.fixture.outputs.sha256 }}
+          release-token: fixture-token
+          build-args: //:build
+          test-args: //:test
+      - name: Exercise test failure propagation
+        id: negative
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: ./roma
+        with:
+          version: v1.2.3
+          source: ${{ steps.fixture.outputs.source }}
+          sha256: ${{ steps.fixture.outputs.sha256 }}
+          release-token: fixture-token
+          test-args: //:fail
+      - name: Resolve ordered registries with the action
+        id: native
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./roma
+        with:
+          version: v1.2.3
+          source: ${{ steps.fixture.outputs.source }}
+          sha256: ${{ steps.fixture.outputs.sha256 }}
+          release-token: fixture-token
+          resolve-native-modules: 'true'
+          registries: |
+            https://registry.tbzl.dev/
+            https://bcr.bazel.build/
+      - name: Require the expected commands and failure
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          OUTCOME: ${{ steps.negative.outcome }}
+          SOURCES: ${{ steps.native.outputs.module-sources }}
+        run: |
+          test "$OUTCOME" = failure
+          test -d "$SOURCES"
+          {
+            printf 'build //:build\ntest //:test\nbuild //...\ntest //:fail\n'
+            printf 'modules --resolve --include-builtin --out %s --registry https://registry.tbzl.dev/ --registry https://bcr.bazel.build/\n' "${SOURCES%/external}"
+            printf 'build --fetched %s //...\ntest --fetched %s //...\n' "$SOURCES" "$SOURCES"
+          } | diff - "$RUNNER_TEMP/roma-fixture/commands"

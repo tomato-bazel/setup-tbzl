@@ -1,0 +1,133 @@
+name: Build and test with Roma
+description: Install a pinned Roma release and run its build and test commands
+inputs:
+  version:
+    description: Exact Roma release tag
+    required: true
+  source:
+    description: Full source commit of the Roma release
+    required: true
+  sha256:
+    description: Expected SHA-256 of the archive for this runner
+    required: true
+  release-token:
+    description: Token with contents read access to tomato-bazel/roma
+    required: true
+  resolve-native-modules:
+    description: Resolve pinned Bzlmod sources and built-in modules before building
+    default: 'false'
+  registries:
+    description: Optional registry URLs in resolution priority order, one per line
+    default: ''
+  build-args:
+    description: Arguments to roma build, one per line
+    default: //...
+  test-args:
+    description: Arguments to roma test, one per line
+    default: //...
+outputs:
+  module-sources:
+    description: Directory of fetched modules when native resolution is enabled
+    value: ${{ steps.modules.outputs.sources }}
+  executable:
+    description: Absolute path to the verified Roma executable
+    value: ${{ steps.install.outputs.executable }}
+runs:
+  using: composite
+  steps:
+    - name: Install pinned Roma release
+      id: install
+      shell: bash
+      env:
+        ROMA_VERSION: ${{ inputs.version }}
+        ROMA_SOURCE: ${{ inputs.source }}
+        ROMA_SHA256: ${{ inputs.sha256 }}
+        GH_TOKEN: ${{ inputs.release-token }}
+        EVENT: ${{ github.event_name }}
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        if [[ "$EVENT" == pull_request_target || ( "$EVENT" == pull_request && "$PR_HEAD_REPO" != "$REPOSITORY" ) ]]; then
+          echo "::error::Private Roma releases require a trusted workflow."
+          exit 1
+        fi
+        if [[ -z "$GH_TOKEN" ]]; then
+          echo "::error::Pass a token with read access to the Roma repository."
+          exit 1
+        fi
+        if [[ ! "$ROMA_VERSION" =~ ^v[0-9][A-Za-z0-9._+-]*$ ||
+              ! "$ROMA_SOURCE" =~ ^[a-f0-9]{40}$ ||
+              ! "$ROMA_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+          echo "::error::Provide an exact release tag, source commit, and archive SHA-256."
+          exit 1
+        fi
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64) platform=linux-amd64 ;;
+          Linux/aarch64) platform=linux-arm64 ;;
+          Darwin/x86_64) platform=darwin-amd64 ;;
+          Darwin/arm64) platform=darwin-arm64 ;;
+          *) echo "::error::Unsupported Roma runner platform."; exit 1 ;;
+        esac
+        dir=$(mktemp -d "$RUNNER_TEMP/roma.XXXXXX")
+        archive="roma-${ROMA_VERSION}-${platform}.tar.gz"
+        if ! gh release download "$ROMA_VERSION" --repo tomato-bazel/roma \
+          --pattern "$archive" --dir "$dir"; then
+          echo "::error::Cannot download the pinned Roma archive. Check the version, platform, and repository access."
+          exit 1
+        fi
+        unset GH_TOKEN
+        sum=$(shasum -a 256 "$dir/$archive")
+        if [[ "${sum%% *}" != "$ROMA_SHA256" ]]; then
+          echo "::error::Roma archive checksum mismatch."
+          exit 1
+        fi
+        tar -xzf "$dir/$archive" -C "$dir" roma BUILD-INFO
+        grep -Fxq "version=$ROMA_VERSION" "$dir/BUILD-INFO"
+        grep -Fxq "source=$ROMA_SOURCE" "$dir/BUILD-INFO"
+        grep -Fxq "platform=$platform" "$dir/BUILD-INFO"
+        test -x "$dir/roma"
+        printf 'executable=%s\n' "$dir/roma" >> "$GITHUB_OUTPUT"
+    - name: Resolve native module sources
+      id: modules
+      if: inputs.resolve-native-modules == 'true'
+      shell: bash
+      env:
+        ROMA: ${{ steps.install.outputs.executable }}
+        REGISTRIES: ${{ inputs.registries }}
+      run: |
+        set -euo pipefail
+        state=$(mktemp -d "$RUNNER_TEMP/roma-modules.XXXXXX")
+        registry_args=()
+        while IFS= read -r registry; do
+          [[ -z "$registry" ]] || registry_args+=(--registry "$registry")
+        done <<< "$REGISTRIES"
+        "$ROMA" modules --resolve --include-builtin --out "$state" "${registry_args[@]}"
+        printf 'sources=%s\n' "$state/external" >> "$GITHUB_OUTPUT"
+    - name: Build and test the checkout
+      shell: bash
+      env:
+        ROMA: ${{ steps.install.outputs.executable }}
+        MODULE_SOURCES: ${{ steps.modules.outputs.sources }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+        TEST_ARGS: ${{ inputs.test-args }}
+      run: |
+        set -euo pipefail
+        build_args=()
+        test_args=()
+        while IFS= read -r arg; do
+          [[ -z "$arg" ]] || build_args+=("$arg")
+        done <<< "$BUILD_ARGS"
+        while IFS= read -r arg; do
+          [[ -z "$arg" ]] || test_args+=("$arg")
+        done <<< "$TEST_ARGS"
+        if (( ${#build_args[@]} == 0 || ${#test_args[@]} == 0 )); then
+          echo "::error::Both Roma build and test require arguments."
+          exit 1
+        fi
+        if [[ -n "$MODULE_SOURCES" ]]; then
+          build_args=(--fetched "$MODULE_SOURCES" "${build_args[@]}")
+          test_args=(--fetched "$MODULE_SOURCES" "${test_args[@]}")
+        fi
+        "$ROMA" build "${build_args[@]}"
+        "$ROMA" test "${test_args[@]}"
